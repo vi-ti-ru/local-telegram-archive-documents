@@ -5,21 +5,18 @@ import fitz
 from webdav3.client import Client
 from PIL import Image
 import shutil
-import fitz
 from datetime import datetime
+import io
+from dotenv import load_dotenv
+import webbrowser
 # весь наш интерфейс, сложно но можно
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QPixmap, QIcon, QFontMetrics
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget, QListWidget, 
                             QPushButton, QFileDialog, QMessageBox, QLabel, QHBoxLayout,
                             QScrollArea, QListWidgetItem, QSizePolicy, QComboBox, 
                             QLineEdit, QDialog, QFormLayout, QDialogButtonBox, QTabWidget,
-                            QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QPixmap, QIcon
-import io
-from dotenv import load_dotenv
-import webbrowser
+                            QTableWidget, QTableWidgetItem, QHeaderView)
 
 
 load_dotenv()
@@ -28,7 +25,7 @@ class PreviewManager:
     def create_preview(file_path, output_path='temp_preview.png'):
         """Я блять не понимаю, оно снова сломано, я не помню после чего перестало показывать превью, и так работало только с PDF, а сейчас вообще не работает :/"""
         try:
-            # Для PDF файлов
+            # PDF
             if file_path.lower().endswith('.pdf'):
                 return PreviewManager._create_pdf_preview(file_path, output_path)
             
@@ -618,8 +615,7 @@ class DocumentManager(QMainWindow):
         
         buttons = [
             ("Загрузить документ", self.upload_document),
-            ("Удалить локально", lambda: self.delete_document(remote=False)),
-            ("Удалить полностью", lambda: self.delete_document(remote=True)),
+            ("Удалить документ", lambda: self.delete_document(remote=True)),
             ("Открыть документ", self.open_document_threaded),
             ("Открыть на Я.Диск", self.open_on_yadisk),
             ("Синхронизация", self.sync_documents)
@@ -866,64 +862,6 @@ class DocumentManager(QMainWindow):
         dialog = SettingsDialog(self)
         dialog.exec()
         self.load_documents()
-
-    def load_documents(self):
-        """Загрузка списка документов с кнопкой 'Загрузить' справа"""
-        data = self.load_data()
-        self.documents_list.clear()
-        
-        for doc in data["documents"]:
-            item = QListWidgetItem(doc["filename"])
-            item.setData(Qt.ItemDataRole.UserRole, doc)
-            
-            # Настройка внешнего вида
-            if doc['path'].startswith('yadisk:'):
-                item.setIcon(QIcon.fromTheme("cloud-download"))
-                item.setForeground(Qt.GlobalColor.gray)
-                
-                # Создаем виджет для размещения текста и кнопки
-                widget = QWidget()
-                layout = QHBoxLayout(widget)
-                layout.setContentsMargins(5, 2, 5, 2)
-                
-                # Текст с названием файла
-                label = QLabel(doc["filename"])
-                label.setStyleSheet("color: gray;")
-                
-                # Кнопка загрузки справа
-                btn = QPushButton("Загрузить")
-                btn.setStyleSheet("""
-                    QPushButton {
-                        background-color: #4a6fa5;
-                        color: white;
-                        border: none;
-                        padding: 3px 8px;
-                        border-radius: 4px;
-                        font-size: 12px;
-                        min-width: 80px;
-                    }
-                    QPushButton:hover {
-                        background-color: #5a7fb5;
-                    }
-                """)
-                btn.clicked.connect(lambda _, p=doc['remote_path']: self.download_document(p))
-                
-                layout.addWidget(label)
-                layout.addStretch()
-                layout.addWidget(btn)
-                
-                self.documents_list.addItem(item)
-                self.documents_list.setItemWidget(item, widget)
-            else:
-                # Обычное отображение для локальных файлов
-                if doc['filename'].lower().endswith('.pdf'):
-                    item.setIcon(QIcon.fromTheme("application-pdf"))
-                elif doc['filename'].lower().endswith(('.png', '.jpg', '.jpeg')):
-                    item.setIcon(QIcon.fromTheme("image-x-generic"))
-                else:
-                    item.setIcon(QIcon.fromTheme("text-x-generic"))
-                
-                self.documents_list.addItem(item)
     
     def apply_filters(self):
         """фильтр поиска с учетом всех полей документа"""
@@ -1014,7 +952,7 @@ class DocumentManager(QMainWindow):
                 btn.clicked.connect(lambda _, p=doc['remote_path']: self.download_document(p))
                 
                 layout.addWidget(label)
-                layout.addWidget(spacer)  # Добавляем растягивающий элемент
+                layout.addWidget(spacer)
                 layout.addWidget(btn)
                 
                 self.documents_list.addItem(item)
@@ -1374,9 +1312,8 @@ class DocumentManager(QMainWindow):
         return None
     
     def delete_document(self, remote=False):
-        """Удаление выбранного документа (локально или полностью)"""
-        selected_item = self.documents_list.currentItem()
-        if not selected_item:
+        """Удаление локально и полностью"""
+        if not (selected_item := self.documents_list.currentItem()):
             QMessageBox.warning(self, "Ошибка", "Выберите файл для удаления")
             return
         
@@ -1391,38 +1328,35 @@ class DocumentManager(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         
-        if reply == QMessageBox.StandardButton.Yes:
-            try:
-                # Удаление локального файла
-                if "path" in doc and os.path.exists(doc["path"]):
-                    os.remove(doc["path"])
-                
-                # Удаление с Яндекс.Диска
-                if remote and "remote_path" in doc:
-                    try:
-                        if self.webdav_client.check(doc["remote_path"]):
-                            self.webdav_client.clean(doc["remote_path"])
-                    except Exception as e:
-                        print(f"Ошибка при удалении с Яндекс.Диска: {e}")
-                        QMessageBox.warning(self, "Ошибка", f"Не удалось удалить файл с Яндекс.Диска: {str(e)}")
-                
-                # Удаление из базы данных
-                data = self.load_data()
-                
-                data["documents"] = [d for d in data["documents"] if not (
-                    d["filename"] == filename and 
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        
+        try:
+            if os.path.exists(doc.get("path", "")):
+                os.remove(doc["path"])
+            
+            if remote and "remote_path" in doc:
+                try:
+                    if self.webdav_client.check(doc["remote_path"]):
+                        self.webdav_client.clean(doc["remote_path"])
+                except Exception as e:
+                    QMessageBox.warning(self, "Ошибка", f"Не удалось удалить с Яндекс.Диска: {str(e)}")
+            
+            data = self.load_data()
+            data["documents"] = [
+                d for d in data["documents"] 
+                if not (d["filename"] == filename and 
                     d.get("type") == doc.get("type") and 
-                    d.get("doc_number") == doc.get("doc_number")
-                )]
-                self.save_data(data)
-                
-                # Обновляем интерфейс
-                self.load_documents()
-                self.clear_document_info()
-                QMessageBox.information(self, "Успешно", f"Файл успешно удален {action}")
-                
-            except Exception as e:
-                QMessageBox.warning(self, "Ошибка", f"Не удалось удалить файл: {str(e)}")
+                    d.get("doc_number") == doc.get("doc_number"))
+            ]
+            self.save_data(data)
+            
+            self.load_documents()
+            self.clear_document_info()
+            QMessageBox.information(self, "Успешно", f"Файл успешно удален {action}")
+            
+        except Exception as e:
+            QMessageBox.warning(self, "Ошибка", f"Не удалось удалить файл: {str(e)}")
 
     def delete_remote_document(self):
         """Удаление документа полностью (локально и с Яндекс.Диска)"""
