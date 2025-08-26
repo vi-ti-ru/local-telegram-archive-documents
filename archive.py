@@ -1,3 +1,4 @@
+# TODO : 
 import os
 import sys
 import json
@@ -9,8 +10,10 @@ from datetime import datetime
 import io
 from dotenv import load_dotenv
 import webbrowser
+from preview_generator.manager import PreviewManager as PreviewManagerBase
+import tempfile
 # весь наш интерфейс, сложно но можно
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
 from PyQt6.QtGui import QPixmap, QIcon, QFontMetrics
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget, QListWidget, 
                             QPushButton, QFileDialog, QMessageBox, QLabel, QHBoxLayout,
@@ -20,47 +23,94 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget, QL
 
 
 load_dotenv()
+
+class PreviewThread(QThread):
+    preview_generated = pyqtSignal(str, QPixmap)  # Сигнал: путь файла и превью
+    
+    def __init__(self, file_path, preview_manager):
+        super().__init__()
+        self.file_path = file_path
+        self.preview_manager = preview_manager
+    
+    def run(self):
+        """Генерация превью в отдельном потоке"""
+        try:
+            if self.file_path.startswith('yadisk:'):
+                self.preview_generated.emit(self.file_path, None)
+                return
+                
+            if not os.path.exists(self.file_path):
+                self.preview_generated.emit(self.file_path, None)
+                return
+            
+            # Генерируем превью
+            preview_path = self.preview_manager.create_preview(self.file_path)
+            if preview_path and os.path.exists(preview_path):
+                pixmap = QPixmap(preview_path)
+                self.preview_generated.emit(self.file_path, pixmap)
+            else:
+                self.preview_generated.emit(self.file_path, None)
+                
+        except Exception as e:
+            print(f"Ошибка генерации превью в потоке: {e}")
+            self.preview_generated.emit(self.file_path, None)
+
 class PreviewManager:
-    @staticmethod
-    def create_preview(file_path, output_path='temp_preview.png'):
-        """Я блять не понимаю, оно снова сломано, я не помню после чего перестало показывать превью, и так работало только с PDF, а сейчас вообще не работает :/"""
+    def __init__(self):
+        # Создаем временную директорию для кэша превью
+        self.cache_dir = os.path.join(tempfile.gettempdir(), 'document_archive_previews')
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self.manager = PreviewManagerBase(self.cache_dir, create_folder=True)
+    
+    def create_preview(self, file_path, output_path=None):
+        """Создает превью для файла любого поддерживаемого формата"""
         try:
-            # PDF
-            if file_path.lower().endswith('.pdf'):
-                return PreviewManager._create_pdf_preview(file_path, output_path)
+            # Для удаленных файлов превью не доступно
+            if file_path.startswith('yadisk:'):
+                return None
+                
+            # Если файл не существует, возвращаем None
+            if not os.path.exists(file_path):
+                return None
             
-            # Для изображений
-            elif file_path.lower().endswith(('.png', '.jpg', '.jpeg')):
-                return PreviewManager._create_image_preview(file_path, output_path)
+            # Создаем временный файл для превью, если не указан выходной путь
+            if output_path is None:
+                output_path = os.path.join(self.cache_dir, f"preview_{os.path.basename(file_path)}.png")
             
-            # Для остальных типов файлов не получается:C
+            # Генерируем превью
+            preview_path = self.manager.get_jpeg_preview(
+                file_path, 
+                width=800, 
+                height=600
+            )
+            
+            # Копируем превью в нужное место
+            if preview_path and os.path.exists(preview_path):
+                if output_path != preview_path:
+                    shutil.copy2(preview_path, output_path)
+                return output_path
             return None
 
         except Exception as e:
-            print(f"Предпросмотр для этого формата не предусмотрен ^_^: {e}")
+            print(f"Ошибка создания превью: {e}")
             return None
-    @staticmethod
-    def _create_pdf_preview(file_path):
+    
+    def get_preview_pixmap(self, file_path):
+        """Возвращает QPixmap с превью документа"""
+        preview_path = self.create_preview(file_path)
+        if preview_path and os.path.exists(preview_path):
+            pixmap = QPixmap(preview_path)
+            if not pixmap.isNull():
+                return pixmap
+        return None
+    
+    def cleanup(self):
+        """Очищает кэш превью"""
         try:
-            pdf_document = fitz.open(file_path)
-            if pdf_document.page_count > 0:
-                page = pdf_document.load_page(0)
-                pix = page.get_pixmap()
-                return pix
-            return None
+            shutil.rmtree(self.cache_dir)
+            os.makedirs(self.cache_dir, exist_ok=True)
         except Exception as e:
-            print(f"Ошибка создания превью PDF: {e}")
-            return None
-
-    @staticmethod
-    def _create_image_preview(file_path):
-        try:
-            img = Image.open(file_path)
-            img.thumbnail((300, 300))
-            return img
-        except Exception as e:
-            print(f"Ошибка создания превью изображения: {e}")
-            return None
+            print(f"Ошибка очистки кэша превью: {e}")
 
 class OpenFileThread(QThread):
     finished = pyqtSignal()
@@ -347,6 +397,10 @@ class DocumentManager(QMainWindow):
         
         self.data_file = os.path.join(self.base_dir, "data.json")
         self.init_data()
+
+        self.preview_manager = PreviewManager()
+
+        self.preview_thread = None
         
         yandex_login = os.getenv('yandex_login')
         yandex_password = os.getenv('yandex_password')
@@ -385,52 +439,46 @@ class DocumentManager(QMainWindow):
             json.dump(data, f, ensure_ascii=False, indent=4)
     
     def update_preview(self, file_path):
-        """Обновляет превью документа"""
+        """Запускает генерацию превью в отдельном потоке"""
         try:
             if file_path.startswith('yadisk:'):
                 self.clear_preview()
                 return
             
-            preview = PreviewManager.create_preview(file_path)
+            # Останавливаем предыдущий поток, если он запущен
+            if self.preview_thread and self.preview_thread.isRunning():
+                self.preview_thread.quit()
+                self.preview_thread.wait()
             
-            if isinstance(preview, fitz.Pixmap):
-                img_data = preview.tobytes("ppm")
-                pixmap = QPixmap()
-                pixmap.loadFromData(img_data)
-                
-                if not pixmap.isNull():
-                    scaled_pixmap = pixmap.scaled(
-                        self.preview_widget.width() - 20, 
-                        self.preview_widget.height() - 20,
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation
-                    )
-                    self.preview_widget.setPixmap(scaled_pixmap)
-                else:
-                    self.clear_preview()
-                    
-            elif isinstance(preview, Image.Image):
-                img_byte_arr = io.BytesIO()
-                preview.save(img_byte_arr, format='PNG')
-                pixmap = QPixmap()
-                pixmap.loadFromData(img_byte_arr.getvalue())
-                
-                if not pixmap.isNull():
-                    scaled_pixmap = pixmap.scaled(
-                        self.preview_widget.width() - 20, 
-                        self.preview_widget.height() - 20,
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation
-                    )
-                    self.preview_widget.setPixmap(scaled_pixmap)
-                else:
-                    self.clear_preview()
-            else:
-                self.clear_preview()
+            # Создаем и запускаем новый поток
+            self.preview_thread = PreviewThread(file_path, self.preview_manager)
+            self.preview_thread.preview_generated.connect(self.on_preview_generated)
+            self.preview_thread.start()
+            
+            # Временно показываем сообщение о загрузке
+            self.preview_widget.clear()
+            self.preview_widget.setText("Генерация превью...")
                 
         except Exception as e:
-            print(f"Ошибка обновления превью: {e}")
+            print(f"Ошибка запуска потока превью: {e}")
             self.clear_preview()
+
+    def on_preview_generated(self, file_path, pixmap):
+        """Обработчик завершения генерации превью"""
+        # Проверяем, что превью соответствует текущему документу
+        current_item = self.documents_list.currentItem()
+        if current_item and current_item.data(Qt.ItemDataRole.UserRole)["path"] == file_path:
+            if pixmap and not pixmap.isNull():
+                # Масштабируем превью под размер виджета
+                scaled_pixmap = pixmap.scaled(
+                    self.preview_widget.width() - 20, 
+                    self.preview_widget.height() - 20,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation
+                )
+                self.preview_widget.setPixmap(scaled_pixmap)
+            else:
+                self.clear_preview()
 
     def clear_preview(self):
         """Очищает область превью"""
@@ -868,10 +916,9 @@ class DocumentManager(QMainWindow):
         search_text = self.search_edit.text().lower()
         filter_type = self.filter_combo.currentText()
         
-        data = self.load_data()
-        
         for i in range(self.documents_list.count()):
             item = self.documents_list.item(i)
+            widget = self.documents_list.itemWidget(item)
             doc = item.data(Qt.ItemDataRole.UserRole)
             visible = True
             
@@ -909,6 +956,10 @@ class DocumentManager(QMainWindow):
                         visible = False
             
             item.setHidden(not visible)
+            
+            # Также скрываем/показываем виджет
+            if widget:
+                widget.setVisible(not visible)
 
     def load_documents(self):
         """Загрузка списка документов с кнопкой 'Загрузить' справа"""
@@ -916,20 +967,25 @@ class DocumentManager(QMainWindow):
         self.documents_list.clear()
         
         for doc in data["documents"]:
-            item = QListWidgetItem(doc["filename"])
+            # Создаем элемент списка без текста
+            item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, doc)
             
             if doc['path'].startswith('yadisk:'):
+                # Для удаленных файлов устанавливаем иконку и цвет
                 item.setIcon(QIcon.fromTheme("cloud-download"))
                 item.setForeground(Qt.GlobalColor.gray)
                 
+                # Создаем виджет с полной информацией
                 widget = QWidget()
                 layout = QHBoxLayout(widget)
                 layout.setContentsMargins(5, 2, 5, 2)
                 layout.setSpacing(10)
                 
+                # Добавляем метку с именем файла
                 label = QLabel(doc["filename"])
                 label.setStyleSheet("color: gray;")
+                label.setWordWrap(False)  # перенос текста
 
                 spacer = QWidget()
                 spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -957,7 +1013,14 @@ class DocumentManager(QMainWindow):
                 
                 self.documents_list.addItem(item)
                 self.documents_list.setItemWidget(item, widget)
+                
+                # Устанавливаем высоту элемента в зависимости от содержимого
+                height = label.sizeHint().height() + 10  # + отступы
+                item.setSizeHint(QSize(item.sizeHint().width(), max(40, height)))
             else:
+                # Для локальных файлов устанавливаем текст и иконку
+                item.setText(doc["filename"])
+                
                 if doc['filename'].lower().endswith('.pdf'):
                     item.setIcon(QIcon.fromTheme("application-pdf"))
                 elif doc['filename'].lower().endswith(('.png', '.jpg', '.jpeg')):
@@ -1488,7 +1551,21 @@ class DocumentManager(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if hasattr(self, 'documents_list') and self.documents_list.currentItem():
-            self.show_document_info(self.documents_list.currentItem())
+            current_item = self.documents_list.currentItem()
+            if current_item:
+                doc = current_item.data(Qt.ItemDataRole.UserRole)
+                if doc and "path" in doc:
+                    # Обновляем размер существующего превью
+                    pixmap = self.preview_widget.pixmap()
+                    if pixmap and not pixmap.isNull():
+                        scaled_pixmap = pixmap.scaled(
+                            self.preview_widget.width() - 20, 
+                            self.preview_widget.height() - 20,
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation
+                        )
+                        self.preview_widget.setPixmap(scaled_pixmap)
+
     def clear_document_info(self):
         self.name_label.setText("-")
         self.type_label.setText("-")
