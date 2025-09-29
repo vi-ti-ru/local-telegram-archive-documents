@@ -1116,7 +1116,6 @@ class DocumentManager(QMainWindow):
             ("Размер", "size_label"),
             ("Путь", "path_label"),
             ("Дата добавления", "date_label"),
-            ("Telegram ID", "telegram_id_label")
         ]
         
         for field_name, field_var in fields:
