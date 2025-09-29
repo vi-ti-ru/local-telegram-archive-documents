@@ -1,4 +1,10 @@
-# TODO : 
+# TODO : нужно перепроверять, при синхронизации и локальные файлы. При запуске сверять json и файлы на диске, если есть изменения, то указывать их как не скачанные
+# если пользователь удалит их в ручную из папок, все равно указывается как будто они есть, нужно видимо сделать нормальную валидацию, а также сделать исключения, если 
+# все же появляется ошибка когда пытаещься открыть файл который удален в ручную, то мб сделать его серым, как не скачанные файлы, я хз, нужно подумать
+# TODO : создать requirements.txt
+# еще нужно посмотреть почему я создавал локально файл "Документы", если они не используются, мб нужно было для чего то, если нет, нужно убрать, зачем нам мусор
+# думаю после этого можно и отдавать его в работу
+# TODO : при нажатии на кропку синхронизации сделать такую же анимацию как и при загрузке (3 точки) или как нибудь по другому придумаем.
 import os
 import sys
 import json
@@ -12,8 +18,8 @@ import webbrowser
 import tempfile
 import io
 # весь наш интерфейс, сложно но можно
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
-from PyQt6.QtGui import QPixmap, QIcon, QFontMetrics
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer
+from PyQt6.QtGui import QPixmap, QIcon, QFontMetrics, QColor
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget, QListWidget, 
                             QPushButton, QFileDialog, QMessageBox, QLabel, QHBoxLayout,
                             QScrollArea, QListWidgetItem, QSizePolicy, QComboBox, 
@@ -22,6 +28,197 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget, QL
 
 
 load_dotenv()
+
+# Класс для асинхронной загрузки документа с Яндекс.Диска
+class DownloadThread(QThread):
+    finished = pyqtSignal(bool, str, str, str)  # добавил local_path
+    
+    def __init__(self, webdav_client, remote_path, local_path):
+        super().__init__()
+        self.webdav_client = webdav_client
+        self.remote_path = remote_path
+        self.local_path = local_path
+    
+    def run(self):
+        try:
+            self.webdav_client.download(self.remote_path, self.local_path)
+            self.finished.emit(True, "Файл успешно загружен", self.remote_path, self.local_path)
+        except Exception as e:
+            self.finished.emit(False, f"Не удалось загрузить файл: {str(e)}", self.remote_path, self.local_path)
+
+
+# Класс для асинхронной загрузки документа на Яндекс.Диск
+class UploadThread(QThread):
+    finished = pyqtSignal(bool, str)
+    
+    def __init__(self, webdav_client, remote_path, local_path):
+        super().__init__()
+        self.webdav_client = webdav_client
+        self.remote_path = remote_path
+        self.local_path = local_path
+    
+    def run(self):
+        try:
+            self.webdav_client.upload(remote_path=self.remote_path, local_path=self.local_path)
+            self.finished.emit(True, f"Файл успешно загружен на Яндекс.Диск: {self.remote_path}")
+        except Exception as e:
+            self.finished.emit(False, f"Не удалось загрузить файл на Яндекс.Диск: {str(e)}")
+
+# Класс для асинхронной синхронизации
+class SyncThread(QThread):
+    finished = pyqtSignal(bool, str)
+    progress = pyqtSignal(str)
+    
+    def __init__(self, webdav_client, base_dir, data_file):
+        super().__init__()
+        self.webdav_client = webdav_client
+        self.base_dir = base_dir
+        self.data_file = data_file
+        self._is_running = True
+
+    def run(self):
+        try:
+            # Проверяем локальные файлы перед синхронизацией
+            self.progress.emit("Проверка локальных файлов...")
+            self.validate_local_files()
+            
+            self.progress.emit("Ща все будет...")
+            remote_docs = self.check_remote_updates()
+            
+            if not remote_docs:
+                self.finished.emit(True, "Новых документов для синхронизации не найдено")
+                return
+                
+            # Загружаем данные
+            with open(self.data_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            updated = False
+            existing_docs = {
+                (d['filename'].lower(), 
+                 d['type'], 
+                 d.get('doc_number', '').lower(),
+                 d.get('sender', '').lower(),
+                 d.get('executor', '').lower())
+                for d in data['documents']
+            }
+            
+            for remote in remote_docs:
+                if not self._is_running:
+                    break
+                    
+                # Проверяем дубликаты
+                doc_key = (
+                    remote['filename'].lower(),
+                    remote['type'],
+                    remote.get('doc_number', '').lower(),
+                    remote.get('sender', '').lower(),
+                    remote.get('executor', '').lower()
+                )
+                
+                if doc_key not in existing_docs:
+                    doc_data = {
+                        'filename': remote['filename'],
+                        'type': remote['type'],
+                        'path': f"yadisk:{remote['path']}",
+                        'remote_path': remote['path'],
+                        'date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        'size': self.webdav_client.info(remote['path']).get('size', 0)
+                    }
+                    
+                    if 'sender' in remote:
+                        doc_data['sender'] = remote['sender']
+                    if 'doc_number' in remote:
+                        doc_data['doc_number'] = remote['doc_number']
+                    
+                    data['documents'].append(doc_data)
+                    updated = True
+            
+            if updated:
+                with open(self.data_file, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=4)
+                self.finished.emit(True, "Документы успешно синхронизированы")
+            else:
+                self.finished.emit(True, "Новых документов для синхронизации не найдено")
+                
+        except Exception as e:
+            self.finished.emit(False, f"Ошибка синхронизации: {str(e)}")
+
+    def check_remote_updates(self):
+        """Проверка новых документов на Яндекс.Диске"""
+        try:
+            remote_docs = []
+            base_dir = '/Документы/'
+            
+            # Проверяем папку Входящие
+            incoming_dir = f'{base_dir}Входящие/'
+            if self.webdav_client.check(incoming_dir):
+                for item in self.webdav_client.list(incoming_dir):
+                    if not item.endswith('/'):
+                        remote_docs.append({
+                            'path': incoming_dir + item,
+                            'type': 'incoming',
+                            'filename': item
+                        })
+                
+                # Проверяем подпапки отправителей
+                for sender in self.webdav_client.list(incoming_dir):
+                    if sender.endswith('/'):
+                        sender_dir = incoming_dir + sender
+                        for item in self.webdav_client.list(sender_dir):
+                            if not item.endswith('/'):
+                                remote_docs.append({
+                                    'path': sender_dir + item,
+                                    'type': 'incoming',
+                                    'sender': sender[:-1],
+                                    'filename': item
+                                })
+            
+            # Проверяем папку Исходящие
+            outgoing_dir = f'{base_dir}Исходящие/'
+            if self.webdav_client.check(outgoing_dir):
+                for item in self.webdav_client.list(outgoing_dir):
+                    if not item.endswith('/'):
+                        remote_docs.append({
+                            'path': outgoing_dir + item,
+                            'type': 'outgoing',
+                            'filename': item
+                        })
+            
+            return remote_docs
+            
+        except Exception as e:
+            print(f"Ошибка проверки обновлений: {e}")
+            return []
+
+    def validate_local_files(self):
+        """Проверка существования локальных файлов"""
+        try:
+            with open(self.data_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            changed = False
+            for doc in data['documents']:
+                # Если файл помечен как локальный, но не существует
+                if not doc['path'].startswith('yadisk:') and not os.path.exists(doc['path']):
+                    # Если есть remote_path, меняем на удаленный
+                    if 'remote_path' in doc:
+                        doc['path'] = f"yadisk:{doc['remote_path']}"
+                        changed = True
+                    # Если нет remote_path, удаляем документ (файл был удален вручную)
+                    else:
+                        data['documents'].remove(doc)
+                        changed = True
+            
+            if changed:
+                with open(self.data_file, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=4)
+                    
+        except Exception as e:
+            print(f"Ошибка проверки локальных файлов: {e}")
+
+    def stop(self):
+        self._is_running = False
 
 class PreviewThread(QThread):
     preview_generated = pyqtSignal(str, object)
@@ -93,7 +290,7 @@ class PreviewManager:
                 # Для PDF используем PyMuPDF
                 doc = fitz.open(file_path)
                 page = doc.load_page(0)
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                pix = page.get_pixmap(matrix=fitz.Matrix(4, 4))
                 pix.save(output_path)
                 doc.close()
                 return output_path
@@ -336,11 +533,11 @@ class SettingsDialog(QDialog):
             new_executor = {
                 "id": new_id,
                 "name": name,
-                "description": description_edit.text(),
-                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                'description': description_edit.text(),
+                'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }
             
-            data["executors"].append(new_executor)
+            data['executors'].append(new_executor)
             self.parent.save_data(data)
             self.load_data()
     
@@ -348,7 +545,7 @@ class SettingsDialog(QDialog):
         """Удаление выбранного исполнителя"""
         selected = self.executors_table.currentRow()
         if selected == -1:
-            QMessageBox.warning(self, "Ошибка", "Выберите исполнителя для удаления")
+            QMessageBox.warning(self, 'Ошибка', 'Выберите исполнителя для удаления')
             return
         
         executor_id = int(self.executors_table.item(selected, 0).text())
@@ -363,7 +560,7 @@ class SettingsDialog(QDialog):
         
         if reply == QMessageBox.StandardButton.Yes:
             data = self.parent.load_data()
-            data["executors"] = [e for e in data["executors"] if e["id"] != executor_id]
+            data['executors'] = [e for e in data['executors'] if e['id'] != executor_id]
             self.parent.save_data(data)
             self.load_data()
 
@@ -403,14 +600,13 @@ class DocumentManager(QMainWindow):
         self.setGeometry(100, 100, 1000, 600)
         
         self.base_dir = os.path.join(os.path.dirname(__file__), "Документы архива")
-        self.incoming_dir = os.path.join(self.base_dir, "Входящее")
-        self.outgoing_dir = os.path.join(self.base_dir, "Исходящее")
-        self.executors_dir = os.path.join(self.base_dir, "Исполнители")
+        self.incoming_dir = os.path.join(self.base_dir, "Входящие")
+        self.outgoing_dir = os.path.join(self.base_dir, "Исходящие")
         
-        os.makedirs(self.documents_dir, exist_ok=True)
+        # Создаем основные папки
+        os.makedirs(self.base_dir, exist_ok=True)
         os.makedirs(self.incoming_dir, exist_ok=True)
         os.makedirs(self.outgoing_dir, exist_ok=True)
-        os.makedirs(self.executors_dir, exist_ok=True)
         
         self.data_file = os.path.join(self.base_dir, "data.json")
         self.init_data()
@@ -418,9 +614,15 @@ class DocumentManager(QMainWindow):
         self.preview_manager = PreviewManager()
 
         self.preview_thread = None
+        self.download_thread = None
+        self.upload_thread = None
+        self.sync_thread = None
         
-        yandex_login = os.getenv('yandex_login')
-        yandex_password = os.getenv('yandex_password')
+        # Словарь для отслеживания статуса загрузки
+        self.download_status = {}
+        
+        yandex_login = 'mtsuTR@yandex.ru'
+        yandex_password = 'jmwxecmafywqbrzi'
 
         self.webdav_client = Client({
             'webdav_hostname': 'https://webdav.yandex.ru',
@@ -430,8 +632,34 @@ class DocumentManager(QMainWindow):
         
         self.init_ui()
         self.migrate_data()
+        self.validate_local_files()  # Проверяем локальные файлы при запуске
         self.load_documents()
         self.showMaximized()
+
+    def validate_local_files(self):
+        """Проверка существования локальных файлов при запуске"""
+        try:
+            data = self.load_data()
+            changed = False
+            
+            for doc in data['documents']:
+                # Если файл помечен как локальный, но не существует
+                if not doc['path'].startswith('yadisk:') and not os.path.exists(doc['path']):
+                    # Если есть remote_path, меняем на удаленный
+                    if 'remote_path' in doc:
+                        doc['path'] = f"yadisk:{doc['remote_path']}"
+                        changed = True
+                    # Если нет remote_path, удаляем документ (файл был удален вручную)
+                    else:
+                        data['documents'].remove(doc)
+                        changed = True
+            
+            if changed:
+                self.save_data(data)
+                print("Обновлены записи о локальных файлах")
+                    
+        except Exception as e:
+            print(f"Ошибка проверки локальных файлов: {e}")
 
     def init_data(self):
         """Инициализация данных при первом запуске"""
@@ -536,114 +764,8 @@ class DocumentManager(QMainWindow):
             }
         """)    
 
-    def check_remote_updates(self):
-        """Проверка новых документов на Яндекс.Диске"""
-        try:
-            remote_docs = []
-            base_dir = '/Документы/'
-            
-            # Проверяем папку Входящие
-            incoming_dir = f'{base_dir}Входящие/'
-            if self.webdav_client.check(incoming_dir):
-                for item in self.webdav_client.list(incoming_dir):
-                    if not item.endswith('/'):
-                        remote_docs.append({
-                            'path': incoming_dir + item,
-                            'type': 'incoming',
-                            'filename': item
-                        })
-                
-                # Проверяем подпапки отправителей
-                for sender in self.webdav_client.list(incoming_dir):
-                    if sender.endswith('/'):
-                        sender_dir = incoming_dir + sender
-                        for item in self.webdav_client.list(sender_dir):
-                            if not item.endswith('/'):
-                                remote_docs.append({
-                                    'path': sender_dir + item,
-                                    'type': 'incoming',
-                                    'sender': sender[:-1],
-                                    'filename': item
-                                })
-            
-            # Проверяем папку Исходящие
-            outgoing_dir = f'{base_dir}Исходящие/'
-            if self.webdav_client.check(outgoing_dir):
-                for item in self.webdav_client.list(outgoing_dir):
-                    if not item.endswith('/'):
-                        remote_docs.append({
-                            'path': outgoing_dir + item,
-                            'type': 'outgoing',
-                            'filename': item
-                        })
-            
-            return remote_docs
-            
-        except Exception as e:
-            print(f"Ошибка проверки обновлений: {e}")
-            return []
-
-    def sync_documents(self):
-        """Ручная синхронизация с Яндекс.Диском"""
-        try:
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            
-            remote_docs = self.check_remote_updates()
-            data = self.load_data()
-            updated = False
-            
-            # Создаем множество существующих документов для быстрой проверки
-            existing_docs = {
-                (d['filename'].lower(), 
-                d['type'], 
-                d.get('doc_number', '').lower(),
-                d.get('sender', '').lower(),
-                d.get('executor', '').lower())
-                for d in data['documents']
-            }
-            
-            for remote in remote_docs:
-                # Проверяем дубликаты
-                doc_key = (
-                    remote['filename'].lower(),
-                    remote['type'],
-                    remote.get('doc_number', '').lower(),
-                    remote.get('sender', '').lower(),
-                    remote.get('executor', '').lower()
-                )
-                
-                if doc_key not in existing_docs:
-                    doc_data = {
-                        'filename': remote['filename'],
-                        'type': remote['type'],
-                        'path': f"yadisk:{remote['path']}",
-                        'remote_path': remote['path'],
-                        'date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        'size': self.webdav_client.info(remote['path']).get('size', 0)
-                    }
-                    
-                    if 'sender' in remote:
-                        doc_data['sender'] = remote['sender']
-                    if 'doc_number' in remote:
-                        doc_data['doc_number'] = remote['doc_number']
-                    
-                    data['documents'].append(doc_data)
-                    updated = True
-            
-            if updated:
-                self.save_data(data)
-                self.load_documents()
-                QMessageBox.information(self, "Синхронизация", "Документы успешно синхронизированы")
-            else:
-                QMessageBox.information(self, "Синхронизация", "Новых документов для синхронизации не найдено")
-                
-        except Exception as e:
-            QMessageBox.warning(self, "Ошибка", f"Ошибка синхронизации: {str(e)}")
-        finally:
-            QApplication.restoreOverrideCursor()
-
     def download_document(self, remote_path):
-        """Загрузка документа с Яндекс.Диска"""
+        """Асинхронная загрузка документа с Яндекс.Диска"""
         try:
             filename = os.path.basename(remote_path)
             
@@ -659,21 +781,71 @@ class DocumentManager(QMainWindow):
             
             local_path = os.path.join(local_dir, filename)
             
-            self.webdav_client.download(remote_path, local_path)
+            # Помечаем файл как загружающийся
+            self.download_status[remote_path] = "downloading"
+            self.update_document_item(remote_path, "downloading")
+            
+            # Запускаем загрузку в отдельном потоке
+            self.download_thread = DownloadThread(self.webdav_client, remote_path, local_path)
+            self.download_thread.finished.connect(self.on_download_finished)
+            self.download_thread.start()
+            
+        except Exception as e:
+            QMessageBox.warning(self, "Ошибка", f"Не удалось начать загрузку файла: {str(e)}")
 
+    def on_download_finished(self, success, message, remote_path, local_path):
+        """Обработчик завершения загрузки"""
+        if success:
+            # Обновляем данные
             data = self.load_data()
             for doc in data['documents']:
                 if doc.get('remote_path') == remote_path:
                     doc['path'] = local_path
-                    doc.pop('remote_path', None)
+                    # Не удаляем remote_path, оставляем для возможных future needs
                     break
             
             self.save_data(data)
-            self.load_documents()
-            QMessageBox.information(self, "Успех", f"Файл {filename} успешно загружен")
             
-        except Exception as e:
-            QMessageBox.warning(self, "Ошибка", f"Не удалось загрузить файл: {str(e)}")
+            # Убираем статус загрузки
+            if remote_path in self.download_status:
+                del self.download_status[remote_path]
+            
+            # Обновляем список документов
+            self.load_documents()
+        else:
+            # Показываем сообщение об ошибке
+            QMessageBox.warning(self, "Ошибка", message)
+            
+            # Обновляем статус на ошибку
+            self.download_status[remote_path] = "error"
+            self.update_document_item(remote_path, "error")
+
+    def update_document_item(self, remote_path, status):
+        """Обновляет отображение элемента списка в соответствии с статусом"""
+        for i in range(self.documents_list.count()):
+            item = self.documents_list.item(i)
+            widget = self.documents_list.itemWidget(item)
+            
+            if widget and hasattr(widget, 'remote_path') and widget.remote_path == remote_path:
+                if status == "downloading":
+                    # Меняем цвет на синий (загрузка)
+                    item.setBackground(QColor(100, 150, 255, 100))
+                    # Находим кнопку и меняем текст
+                    for child in widget.children():
+                        if isinstance(child, QPushButton):
+                            child.setText("Загрузка...")
+                            child.setEnabled(False)
+                            break
+                elif status == "error":
+                    # Меняем цвет на красный (ошибка)
+                    item.setBackground(QColor(255, 100, 100, 100))
+                    # Восстанавливаем кнопку
+                    for child in widget.children():
+                        if isinstance(child, QPushButton):
+                            child.setText("Загрузить")
+                            child.setEnabled(True)
+                            break
+                break
 
     def init_ui(self):
         central_widget = QWidget()
@@ -689,21 +861,20 @@ class DocumentManager(QMainWindow):
         left_layout = QVBoxLayout(left_panel)
         left_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        ######################
-        #png-шка в левой панели, многовероятно удалю в конце, но пока что пусть будет
+        # Лого (если есть name.png)
         logo_label = QLabel()
         logo_pixmap = QPixmap("name.png")
-
         if not logo_pixmap.isNull():
-            logo_pixmap = logo_pixmap.scaled(200, 200, Qt.AspectRatioMode.KeepAspectRatio, 
-                                        Qt.TransformationMode.SmoothTransformation)
+            logo_pixmap = logo_pixmap.scaled(
+                200, 200,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
             logo_label.setPixmap(logo_pixmap)
             logo_label.setAlignment(Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignCenter)
             logo_label.setStyleSheet("background: transparent;")
             left_layout.addWidget(logo_label)
 
-        ###########################
-        
         # Заголовок
         title_label = QLabel("Архив Local/Web")
         title_label.setStyleSheet("""
@@ -719,17 +890,23 @@ class DocumentManager(QMainWindow):
         title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         left_layout.addWidget(title_label)
         
+        # Кнопки управления
+        self.upload_btn = QPushButton("Загрузить документ")
+        self.delete_btn = QPushButton("Удалить документ")
+        self.sync_btn = QPushButton("Синхронизация")
+        self.settings_btn = QPushButton("Настройки")
+        
         buttons = [
-            ("Загрузить документ", self.upload_document),
-            ("Удалить документ", lambda: self.delete_document(remote=True)),
-            ("Синхронизация", self.sync_documents)
+            (self.upload_btn, self.upload_document),
+            (self.delete_btn, self.delete_document),
+            (self.sync_btn, self.sync_documents),
+            (self.settings_btn, self.open_settings)
         ]
         
-        for text, handler in buttons:
-            btn = QPushButton(text)
+        for btn, handler in buttons:
             btn.setStyleSheet("""
                 QPushButton {
-                    background-color: %s;
+                    background-color: #4a6fa5;
                     color: white;
                     border: none;
                     padding: 10px;
@@ -738,54 +915,23 @@ class DocumentManager(QMainWindow):
                     margin-top: 10px;
                 }
                 QPushButton:hover {
-                    background-color: %s;
+                    background-color: #5a7fb5;
                 }
                 QPushButton:pressed {
-                    background-color: %s;
+                    background-color: #3a5f95;
                 }
-            """ % (
-                "#5a5a5a" if text == "Настройки" else "#4a6fa5",
-                "#6a6a6a" if text == "Настройки" else "#5a7fb5",
-                "#4a4a4a" if text == "Настройки" else "#3a5f95"
-            ))
+            """)
             btn.setFixedHeight(40)
             btn.clicked.connect(handler)
             left_layout.addWidget(btn)
 
         left_layout.addStretch()
-        buttons = [
-            ("Настройки", self.open_settings)
-        ]
-        for text, handler in buttons:
-            btn = QPushButton(text)
-            btn.setStyleSheet("""
-                QPushButton {
-                    background-color: %s;
-                    color: white;
-                    border: none;
-                    padding: 10px;
-                    border-radius: 5px;
-                    font-weight: bold;
-                    margin-top: 10px;
-                }
-                QPushButton:hover {
-                    background-color: %s;
-                }
-                QPushButton:pressed {
-                    background-color: %s;
-                }
-            """ % (
-                "#5a5a5a" if text == "Настройки" or "Архиватор(тест)" or "Парсер Госпабликов(тест)" else "#4a6fa5",
-                "#6a6a6a" if text == "Настройки" or "Архиватор(тест)" or "Парсер Госпабликов(тест)" else "#5a7fb5",
-                "#4a4a4a" if text == "Настройки" or "Архиватор(тест)" or "Парсер Госпабликов(тест)" else "#3a5f95"
-            ))
-            btn.setFixedHeight(40)
-            btn.clicked.connect(handler)
-            left_layout.addWidget(btn)
-
+        
+        # Центральная панель
         center_panel = QWidget()
         center_layout = QVBoxLayout(center_panel)
         
+        # Панель фильтров и поиска
         filter_panel = QWidget()
         filter_layout = QHBoxLayout(filter_panel)
         
@@ -799,9 +945,9 @@ class DocumentManager(QMainWindow):
         
         filter_layout.addWidget(self.filter_combo)
         filter_layout.addWidget(self.search_edit)
-        
         center_layout.addWidget(filter_panel)
         
+        # Список документов
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setStyleSheet("""
@@ -846,9 +992,11 @@ class DocumentManager(QMainWindow):
         
         center_layout.addWidget(scroll_area)
         
+        # Правая панель (превью + инфо)
         right_panel = QWidget()
         right_panel.setFixedWidth(350)
         right_layout = QVBoxLayout(right_panel)
+        
         self.preview_widget = QLabel()
         self.preview_widget.setFixedSize(300, 300)
         self.preview_widget.setStyleSheet("""
@@ -875,13 +1023,12 @@ class DocumentManager(QMainWindow):
         info_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         right_layout.addWidget(info_title)
         
-        # Область с информацией
         self.info_widget = QWidget()
         self.info_layout = QFormLayout(self.info_widget)
         self.info_layout.setVerticalSpacing(8)
         self.info_layout.setContentsMargins(15, 10, 10, 10)
-        
-        # ООООО ЗАЕБ, вечно лагал текст
+
+        # Добавляем поля инфо-панели
         fields = [
             ("Название", "name_label"),
             ("Тип", "type_label"),
@@ -919,15 +1066,16 @@ class DocumentManager(QMainWindow):
             
             setattr(self, field_var, value_label)
             self.info_layout.addRow(label, value_label)
-        
+
         right_layout.addWidget(self.info_widget)
         right_layout.addStretch()
         
+        # Добавляем панели в layout
         main_layout.addWidget(left_panel)
         main_layout.addWidget(center_panel)
         main_layout.addWidget(right_panel)
         
-        # Стиль главного окна
+        # Стиль главного окна и элементов
         self.setStyleSheet("""
             QMainWindow {
                 background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
@@ -937,8 +1085,12 @@ class DocumentManager(QMainWindow):
                 background-color: rgba(255, 255, 255, 0.1);
                 color: white;
                 border: 1px solid #4a6fa5;
-                border-radius: 3px;
-                padding: 5px;
+                border-radius: 5px;
+                padding: 6px;
+            }
+            QLineEdit:focus, QComboBox:focus {
+                border: 1px solid #5a7fb5;
+                background-color: rgba(255, 255, 255, 0.15);
             }
             QComboBox QAbstractItemView {
                 background-color: #516395;
@@ -946,6 +1098,8 @@ class DocumentManager(QMainWindow):
                 selection-background-color: #4a6fa5;
             }
         """)
+
+
     
     def open_settings(self):
         """Открытие диалога настроек"""
@@ -1047,6 +1201,22 @@ class DocumentManager(QMainWindow):
                         background-color: #5a7fb5;
                     }
                 """)
+                
+                # Сохраняем remote_path в виджете для последующего обновления
+                widget.remote_path = doc['remote_path']
+                
+                # Проверяем статус загрузки
+                if doc['remote_path'] in self.download_status:
+                    status = self.download_status[doc['remote_path']]
+                    if status == "downloading":
+                        item.setBackground(QColor(100, 150, 255, 100))
+                        btn.setText("Загрузка...")
+                        btn.setEnabled(False)
+                    elif status == "error":
+                        item.setBackground(QColor(255, 100, 100, 100))
+                        btn.setText("Загрузить")
+                        btn.setEnabled(True)
+                
                 btn.clicked.connect(lambda _, p=doc['remote_path']: self.download_document(p))
                 
                 layout.addWidget(label)
@@ -1160,10 +1330,7 @@ class DocumentManager(QMainWindow):
                 
                 executor = doc_data.get("executor")
                 if executor:
-                    if not self.webdav_client.check(f'{base_dir}Исполнители/'):
-                        self.webdav_client.mkdir(f'{base_dir}Исполнители/')
-                    
-                    executor_dir = f'{base_dir}Исполнители/{executor}/'
+                    executor_dir = f'{remote_dir}{executor}/'
                     if not self.webdav_client.check(executor_dir):
                         self.webdav_client.mkdir(executor_dir)
                     
@@ -1177,25 +1344,35 @@ class DocumentManager(QMainWindow):
             if self.webdav_client.check(remote_path):
                 raise Exception(f"Файл {filename} уже существует на Яндекс.Диске по пути {remote_path}")
             
-            self.webdav_client.upload(remote_path=remote_path, local_path=file_path)
-
-            doc_data['remote_path'] = remote_path
-            
-            # Для отладки. выводим информацию о загрузке
-            print(f"Файл успешно загружен на Яндекс.Диск: {remote_path}")
+            # Запускаем загрузку в отдельном потоке
+            self.upload_thread = UploadThread(self.webdav_client, remote_path, file_path)
+            self.upload_thread.finished.connect(lambda success, msg: self.on_upload_finished(success, msg, doc_data, remote_path))
+            self.upload_thread.start()
             
             return True
         
         except Exception as e:
             print(f"Ошибка загрузки на Яндекс.Диск: {e}")
-            if 'remote_path' in locals() and remote_path and self.webdav_client.check(remote_path):
-                try:
-                    self.webdav_client.clean(remote_path)
-                except Exception as clean_error:
-                    print(f"Ошибка при очистке частично загруженного файла: {clean_error}")
-            
             # Пробрасываем исключение дальше
             raise Exception(f"Не удалось загрузить файл на Яндекс.Диск: {str(e)}")
+    
+    def on_upload_finished(self, success, message, doc_data, remote_path):
+        """Обработчик завершения загрузки на Яндекс.Диск"""
+        if success:
+            doc_data['remote_path'] = remote_path
+            # Сохраняем данные
+            data = self.load_data()
+            data['documents'].append(doc_data)
+            self.save_data(data)
+            
+            # Обновляем интерфейс
+            self.load_documents()
+        else:
+            QMessageBox.critical(
+                self,
+                "Ошибка",
+                f"Не удалось загрузить документ:\n{message}"
+            )
     
     def process_document_upload(self, doc_type, type_dialog):
         """Полная обработка загрузки документа"""
@@ -1249,7 +1426,6 @@ class DocumentManager(QMainWindow):
                     return
                 
                 doc_data['sender'] = sender
-                doc_data['sender_id'] = next(s["id"] for s in data["senders"] if s["name"] == sender)
                 
                 # Создание папки отправителя локально
                 sender_dir = os.path.join(self.incoming_dir, sender)
@@ -1265,10 +1441,9 @@ class DocumentManager(QMainWindow):
                     return
                 
                 doc_data['executor'] = executor
-                doc_data['executor_id'] = next(e["id"] for e in data["executors"] if e["name"] == executor)
                 
                 # Создание папки исполнителя локально
-                executor_dir = os.path.join(self.executors_dir, executor)
+                executor_dir = os.path.join(self.outgoing_dir, executor)
                 os.makedirs(executor_dir, exist_ok=True)
                 
                 # Копирование файла
@@ -1278,25 +1453,8 @@ class DocumentManager(QMainWindow):
             # 5. Сохраняем локальный путь
             doc_data['path'] = local_path
             
-            # 6. Загрузка на Яндекс.Диск
-            if not self.upload_to_yadisk(local_path, doc_type, doc_data):
-                raise Exception("Не удалось загрузить на Яндекс.Диск")
-            
-            # 7. Сохранение в базу данных
-            data['documents'].append(doc_data)
-            self.save_data(data)
-            
-            # 8. Обновление интерфейса
-            self.load_documents()
-            
-            QMessageBox.information(
-                self,
-                "Успешно",
-                f"Документ успешно загружен:\n"
-                f"Номер: {doc_details['doc_number']}\n"
-                f"Дата: {doc_details['doc_date']}\n"
-                f"Размер: {doc_data['size']/1024:.1f} KB"
-            )
+            # 6. Загрузка на Яндекс.Диск (асинхронно)
+            self.upload_to_yadisk(local_path, doc_type, doc_data)
             
         except Exception as e:
             # Удаляем временные файлы в случае ошибки
@@ -1331,8 +1489,31 @@ class DocumentManager(QMainWindow):
         create_btn = QPushButton(create_title)
         cancel_btn = QPushButton("Отмена")
         
-        select_btn.clicked.connect(dialog.accept)
-        create_btn.clicked.connect(lambda: self.create_new_entity(entity_type, dialog))
+        selected_entity = None
+        
+        def on_select():
+            nonlocal selected_entity
+            if entity_list.currentItem():
+                selected_entity = entity_list.currentItem().text()
+                dialog.accept()
+        
+        def on_create():
+            nonlocal selected_entity
+            new_entity = self.create_new_entity(entity_type, dialog)
+            if new_entity:
+                # Обновляем список
+                entity_list.clear()
+                data = self.load_data()
+                for entity in data[f"{entity_type}s"]:
+                    entity_list.addItem(entity["name"])
+                # Выбираем созданного
+                for i in range(entity_list.count()):
+                    if entity_list.item(i).text() == new_entity:
+                        entity_list.setCurrentRow(i)
+                        break
+        
+        select_btn.clicked.connect(on_select)
+        create_btn.clicked.connect(on_create)
         cancel_btn.clicked.connect(dialog.reject)
         
         btn_layout.addWidget(select_btn)
@@ -1343,14 +1524,12 @@ class DocumentManager(QMainWindow):
         layout.addLayout(btn_layout)
         
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            if entity_list.currentItem():
-                return entity_list.currentItem().text()
+            return selected_entity
         
         return None
     
     def create_new_entity(self, entity_type, parent_dialog):
-        parent_dialog.close()
-        
+        """Создание нового отправителя/исполнителя без закрытия родительского диалога"""
         dialog = QDialog(self)
         dialog.setWindowTitle(f"Создать нового {entity_type}")
         dialog.setFixedSize(300, 150)
@@ -1384,8 +1563,9 @@ class DocumentManager(QMainWindow):
                 QMessageBox.warning(self, "Ошибка", f"{entity_type} с таким именем уже существует")
                 return None
             
+            new_id = max(e["id"] for e in entities) + 1 if entities else 1
             new_entity = {
-                "id": len(entities) + 1,
+                "id": new_id,
                 "name": name,
                 "description": description_edit.text(),
                 "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1394,30 +1574,22 @@ class DocumentManager(QMainWindow):
             entities.append(new_entity)
             self.save_data(data)
             
-            if entity_type == "executor":
-                executor_dir = os.path.join(self.executors_dir, name)
-                os.makedirs(executor_dir, exist_ok=True)
-                
-                # Создаем папку на Яндекс.Диске
-                remote_executor_dir = f'/Документы/Исполнители/{name}'
-                if not self.webdav_client.check(remote_executor_dir):
-                    self.webdav_client.mkdir(remote_executor_dir)
+            # Создаем папку на Яндекс.Диске
+            base_dir = '/Документы/'
+            if entity_type == "sender":
+                remote_dir = f'{base_dir}Входящие/{name}/'
+            else:
+                remote_dir = f'{base_dir}Исходящие/{name}/'
             
-            elif entity_type == "sender":
-                sender_dir = os.path.join(self.incoming_dir, name)
-                os.makedirs(sender_dir, exist_ok=True)
-                
-                # Создаем папку на Яндекс.Диске -_-
-                remote_sender_dir = f'/Документы/Входящие/{name}'
-                if not self.webdav_client.check(remote_sender_dir):
-                    self.webdav_client.mkdir(remote_sender_dir)
+            if not self.webdav_client.check(remote_dir):
+                self.webdav_client.mkdir(remote_dir)
             
             return name
         
         return None
     
-    def delete_document(self, remote=False):
-        """Удаление локально и полностью"""
+    def delete_document(self):
+        """Удаление документа только локально"""
         if not (selected_item := self.documents_list.currentItem()):
             QMessageBox.warning(self, "Ошибка", "Выберите файл для удаления")
             return
@@ -1425,11 +1597,10 @@ class DocumentManager(QMainWindow):
         doc = selected_item.data(Qt.ItemDataRole.UserRole)
         filename = doc["filename"]
         
-        action = "локально"
         reply = QMessageBox.question(
             self, 
             'Подтверждение', 
-            f'Вы уверены что хотите удалить файл {filename} {action}?', 
+            f'Вы уверены что хотите удалить файл {filename}?', 
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         
@@ -1437,16 +1608,11 @@ class DocumentManager(QMainWindow):
             return
         
         try:
+            # Удаляем только локальную копию
             if os.path.exists(doc.get("path", "")):
                 os.remove(doc["path"])
             
-            if remote and "remote_path" in doc:
-                try:
-                    if self.webdav_client.check(doc["remote_path"]):
-                        self.webdav_client.clean(doc["remote_path"])
-                except Exception as e:
-                    QMessageBox.warning(self, "Ошибка", f"Не удалось удалить с Яндекс.Диска: {str(e)}")
-            
+            # Удаляем запись из базы данных
             data = self.load_data()
             data["documents"] = [
                 d for d in data["documents"] 
@@ -1458,17 +1624,39 @@ class DocumentManager(QMainWindow):
             
             self.load_documents()
             self.clear_document_info()
-            QMessageBox.information(self, "Успешно", f"Файл успешно удален {action}")
             
         except Exception as e:
             QMessageBox.warning(self, "Ошибка", f"Не удалось удалить файл: {str(e)}")
 
-    def delete_remote_document(self):
-        """Удаление документа полностью (локально и с Яндекс.Диска)"""
-        self.delete_document(remote=True)
-    
+    def sync_documents(self):
+        """Асинхронная синхронизация с Яндекс.Диском"""
+        # Меняем текст кнопки и отключаем ее
+        self.sync_btn.setText("Синхронизация...")
+        self.sync_btn.setEnabled(False)
+        
+        # Запускаем синхронизацию в отдельном потоке
+        self.sync_thread = SyncThread(self.webdav_client, self.base_dir, self.data_file)
+        self.sync_thread.finished.connect(self.on_sync_finished)
+        self.sync_thread.progress.connect(self.on_sync_progress)
+        self.sync_thread.start()
+
+    def on_sync_progress(self, message):
+        """Обновление прогресса синхронизации"""
+        self.sync_btn.setText(message)
+
+    def on_sync_finished(self, success, message):
+        """Завершение синхронизации"""
+        # Восстанавливаем кнопку
+        self.sync_btn.setText("Синхронизация")
+        self.sync_btn.setEnabled(True)
+        
+        if success:
+            self.load_documents()
+            QMessageBox.information(self, "Успех", message)
+        else:
+            QMessageBox.warning(self, "Ошибка", message)
+
     def open_document_threaded(self):
-        """Открытие документа в отдельном потоке"""
         selected_item = self.documents_list.currentItem()
         if not selected_item:
             QMessageBox.warning(self, "Ошибка", "Выберите файл для открытия")
@@ -1476,10 +1664,25 @@ class DocumentManager(QMainWindow):
         
         doc = selected_item.data(Qt.ItemDataRole.UserRole)
         file_path = doc["path"]
-        self.open_thread = QThread()
-        self.open_thread.run = lambda: self.open_file(file_path)
+
+        if file_path.startswith('yadisk:'):
+            QMessageBox.information(self, "Информация", "Сначала нужно загрузить файл с Яндекс.Диска")
+            return
+
+        # Проверяем существование файла
+        if not os.path.exists(file_path):
+            QMessageBox.warning(self, "Ошибка", "Файл не найден. Возможно, он был удален.")
+            # Обновляем статус файла
+            self.validate_local_files()
+            self.load_documents()
+            return
+
+        # Запускаем отдельный поток
+        self.open_thread = OpenFileThread(file_path)
+        self.open_thread.finished.connect(self.open_thread.deleteLater)
         self.open_thread.start()
-    
+
+
     def open_file(self, file_path):
         """Открытие файла (вызывается в отдельном потоке)"""
         try:
@@ -1599,6 +1802,7 @@ class DocumentManager(QMainWindow):
         if hasattr(self, 'documents_list') and self.documents_list.currentItem():
             doc = self.documents_list.currentItem().data(Qt.ItemDataRole.UserRole)
             QMessageBox.information(self, "Полный путь", doc["path"])
+            
     def migrate_data(self):
         data = self.load_data()
         changed = False
@@ -1613,63 +1817,6 @@ class DocumentManager(QMainWindow):
                     changed = True
         if changed:
             self.save_data(data)
-class SyncThread(QThread):
-    update_progress = pyqtSignal(int, str)
-    finished = pyqtSignal(bool, str)
-
-    def __init__(self, webdav_client, local_dir):
-        super().__init__()
-        self.webdav_client = webdav_client
-        self.local_dir = local_dir
-        self._is_running = True
-
-    def run(self):
-        try:
-            self.sync_folder('Входящие')
-            self.sync_folder('Исходящие')
-            self.sync_executors()
-            self.finished.emit(True, "Синхронизация завершена")
-        except Exception as e:
-            self.finished.emit(False, f"Ошибка: {str(e)}")
-
-    def sync_folder(self, folder_type):
-        remote_dir = f'/Документы/{folder_type}/'
-        local_dir = os.path.join(self.local_dir, folder_type)
-        
-        if not self.webdav_client.check(remote_dir):
-            return
-
-        files = self.webdav_client.list(remote_dir)
-        for file in files:
-            if not self._is_running:
-                break
-                
-            remote_path = f"{remote_dir}{file}"
-            local_path = os.path.join(local_dir, file)
-            
-            if not os.path.exists(local_path):
-                self.update_progress.emit(0, f"Загрузка {file}...")
-                self.webdav_client.download(remote_path, local_path)
-                self.update_progress.emit(1, f"Загружен {file}")
-
-    def sync_executors(self):
-        remote_base = '/Документы/Исполнители/'
-        if not self.webdav_client.check(remote_base):
-            return
-
-        executors = self.webdav_client.list(remote_base)
-        for executor in executors:
-            if not self._is_running:
-                break
-                
-            remote_dir = f"{remote_base}{executor}/"
-            local_dir = os.path.join(self.local_dir, 'Executors', executor)
-            os.makedirs(local_dir, exist_ok=True)
-            
-            self.sync_folder_contents(remote_dir, local_dir)
-
-    def stop(self):
-        self._is_running = False
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
