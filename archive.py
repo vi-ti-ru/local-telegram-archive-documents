@@ -62,17 +62,7 @@ class TelegramStorage:
             
             # Подготавливаем метаданные для описания
             caption = self._format_caption(metadata) if metadata else "Документ из архива"
-            
-            # Создаем inline-клавиатуру с кнопкой "Скачать"
-            keyboard = {
-                "inline_keyboard": [[
-                    {
-                        "text": "📥 Скачать файл",
-                        "url": self._create_download_url(metadata['filename']) if metadata else ""
-                    }
-                ]]
-            }
-            reply_markup = json.dumps(keyboard)
+
             
             with open(file_path, 'rb') as file:
                 files = {'document': file}
@@ -80,7 +70,6 @@ class TelegramStorage:
                     'chat_id': self.chat_id,
                     'caption': caption,
                     'parse_mode': 'HTML',
-                    'reply_markup': reply_markup
                 }
                 
                 response = requests.post(url, files=files, data=data, timeout=60)
@@ -124,66 +113,7 @@ class TelegramStorage:
         if metadata.get('executor'):
             caption += f"🛠️ Исполнитель: {metadata['executor']}\n"
             
-        caption += f"⏰ Загружено: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
-        caption += "💡 <i>Нажмите '📥 Скачать файл' для загрузки</i>"
         return caption
-    
-    def _create_download_url(self, filename):
-        """Создает URL для скачивания файла"""
-        # Кодируем имя файла для URL
-        encoded_filename = urllib.parse.quote(filename)
-        # Создаем глубокую ссылку для скачивания
-        return f"https://t.me/{self.chat_id.replace('@', '')}?start=download_{encoded_filename}"
-    
-    def add_download_button_to_existing_message(self, message_id, filename):
-        """Добавляет кнопку скачивания к существующему сообщению"""
-        try:
-            url = f"https://api.telegram.org/bot{self.token}/editMessageReplyMarkup"
-            
-            keyboard = {
-                "inline_keyboard": [[
-                    {
-                        "text": "📥 Скачать файл",
-                        "url": self._create_download_url(filename)
-                    }
-                ]]
-            }
-            
-            data = {
-                'chat_id': self.chat_id,
-                'message_id': message_id,
-                'reply_markup': json.dumps(keyboard)
-            }
-            
-            response = requests.post(url, data=data)
-            return response.json().get('ok', False)
-            
-        except Exception as e:
-            print(f"❌ Ошибка добавления кнопки: {e}")
-            return False
-    
-    def download_file(self, file_id, destination_path):
-        """Скачивание файла из Telegram"""
-        try:
-            # Получаем информацию о файле
-            file_info_url = f"https://api.telegram.org/bot{self.token}/getFile?file_id={file_id}"
-            file_info_response = requests.get(file_info_url)
-            file_info = file_info_response.json()
-            
-            if file_info.get('ok'):
-                file_path = file_info['result']['file_path']
-                download_url = f"https://api.telegram.org/file/bot{self.token}/{file_path}"
-                
-                # Скачиваем файл
-                response = requests.get(download_url)
-                with open(destination_path, 'wb') as f:
-                    f.write(response.content)
-                return True
-            return False
-            
-        except Exception as e:
-            print(f"❌ Ошибка скачивания из Telegram: {e}")
-            return False
     
     def get_channel_files(self, limit=100):
         """Получение списка файлов из канала"""
