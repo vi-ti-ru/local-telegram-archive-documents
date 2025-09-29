@@ -1621,7 +1621,6 @@ class DocumentManager(QMainWindow):
             self.executor_label.setText(executor)
             self.size_label.setText(size_text)
             self.date_label.setText(date_added)
-            self.telegram_id_label.setText(telegram_id if telegram_id != "-" else "Не загружен")
             
             self.update_preview(path)
             
