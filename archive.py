@@ -127,38 +127,6 @@ class TelegramStorage:
             caption += f"🛠️ Исполнитель: {metadata['executor']}\n"
 
         return caption
-    
-    def download_file(self, file_id, destination_path):
-        """Скачивание файла из Telegram"""
-        try:
-            # Получаем информацию о файле
-            file_info_url = f"https://api.telegram.org/bot{self.token}/getFile?file_id={file_id}"
-            logger.info(f"Получение информации о файле: {file_id}")
-            file_info_response = requests.get(file_info_url)
-            file_info = file_info_response.json()
-            
-            if file_info.get('ok'):
-                file_path = file_info['result']['file_path']
-                download_url = f"https://api.telegram.org/file/bot{self.token}/{file_path}"
-                logger.info(f"Скачивание файла: {download_url}")
-                
-                # Скачиваем файл
-                response = requests.get(download_url)
-                if response.status_code == 200:
-                    with open(destination_path, 'wb') as f:
-                        f.write(response.content)
-                    logger.info(f"Файл успешно скачан: {destination_path}")
-                    return True
-                else:
-                    logger.error(f"Ошибка скачивания файла: {response.status_code}")
-                    return False
-            else:
-                logger.error(f"Ошибка получения информации о файле: {file_info}")
-                return False
-            
-        except Exception as e:
-            logger.error(f"Ошибка скачивания из Telegram: {e}")
-            return False
 
 class PreviewThread(QThread):
     preview_generated = pyqtSignal(str, object)
@@ -563,36 +531,62 @@ class SettingsDialog(QDialog):
         token = self.telegram_token_edit.text().strip()
         chat_id = self.telegram_chat_id_edit.text().strip()
         
+        env_file_path = '.env'
+        env_data = {}
+        
+        # Читаем существующие переменные из .env файла
+        if os.path.exists(env_file_path):
+            with open(env_file_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        env_data[key] = value
+        
+        # Обновляем только Telegram настройки
         if token:
-            # Обновляем .env файл
-            env_lines = []
-            if os.path.exists('.env'):
-                with open('.env', 'r', encoding='utf-8') as f:
-                    env_lines = f.readlines()
+            env_data['TELEGRAM_BOT_TOKEN'] = token
+        elif 'TELEGRAM_BOT_TOKEN' in env_data:
+            # Если токен удален, удаляем его из настроек
+            del env_data['TELEGRAM_BOT_TOKEN']
             
-            # Обновляем или добавляем переменные
-            updated_token = False
-            updated_chat_id = False
-            for i, line in enumerate(env_lines):
-                if line.startswith('TELEGRAM_BOT_TOKEN='):
-                    env_lines[i] = f'TELEGRAM_BOT_TOKEN={token}\n'
-                    updated_token = True
-                elif line.startswith('TELEGRAM_CHAT_ID='):
-                    env_lines[i] = f'TELEGRAM_CHAT_ID={chat_id}\n'
-                    updated_chat_id = True
+        if chat_id:
+            env_data['TELEGRAM_CHAT_ID'] = chat_id
+        elif 'TELEGRAM_CHAT_ID' in env_data:
+            # Если chat_id удален, удаляем его из настроек
+            del env_data['TELEGRAM_CHAT_ID']
+        
+        # Записываем обновленные настройки обратно в .env файл
+        try:
+            with open(env_file_path, 'w', encoding='utf-8') as f:
+                for key, value in env_data.items():
+                    f.write(f'{key}={value}\n')
             
-            if not updated_token:
-                env_lines.append(f'TELEGRAM_BOT_TOKEN={token}\n')
-            if not updated_chat_id and chat_id:
-                env_lines.append(f'TELEGRAM_CHAT_ID={chat_id}\n')
+            logger.info(f"Настройки Telegram сохранены в {env_file_path}")
             
-            with open('.env', 'w', encoding='utf-8') as f:
-                f.writelines(env_lines)
-            
-            # Обновляем переменные окружения
+        except Exception as e:
+            logger.error(f"Ошибка сохранения настроек Telegram: {e}")
+            QMessageBox.warning(self, "Ошибка", f"Не удалось сохранить настройки: {e}")
+            return
+        
+        # Обновляем переменные окружения в текущей сессии
+        if token:
             os.environ['TELEGRAM_BOT_TOKEN'] = token
-            if chat_id:
-                os.environ['TELEGRAM_CHAT_ID'] = chat_id
+        elif 'TELEGRAM_BOT_TOKEN' in os.environ:
+            del os.environ['TELEGRAM_BOT_TOKEN']
+            
+        if chat_id:
+            os.environ['TELEGRAM_CHAT_ID'] = chat_id
+        elif 'TELEGRAM_CHAT_ID' in os.environ:
+            del os.environ['TELEGRAM_CHAT_ID']
+        
+        # Перезагружаем переменные окружения для TelegramStorage
+        load_dotenv(override=True)
+        
+        # Обновляем статус Telegram в главном окне
+        self.parent.update_telegram_status()
+        
+        QMessageBox.information(self, "Успех", "Настройки Telegram успешно сохранены!")
         
         super().accept()
 
