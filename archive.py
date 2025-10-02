@@ -12,6 +12,8 @@ import tempfile
 import io
 import requests
 import urllib.parse
+import time
+import logging
 # весь наш интерфейс, сложно но можно
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
 from PyQt6.QtGui import QPixmap, QIcon, QFontMetrics
@@ -19,20 +21,30 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget, QL
                             QPushButton, QFileDialog, QMessageBox, QLabel, QHBoxLayout,
                             QScrollArea, QListWidgetItem, QSizePolicy, QComboBox, 
                             QLineEdit, QDialog, QFormLayout, QDialogButtonBox, QTabWidget,
-                            QTableWidget, QTableWidgetItem, QHeaderView)
+                            QTableWidget, QTableWidgetItem, QHeaderView, QTextEdit)
 load_dotenv()
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('telegram_sync.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger('TelegramSync')
 
 class TelegramStorage:
     def __init__(self):
         self.token = os.getenv('TELEGRAM_BOT_TOKEN')
         self.chat_id = os.getenv('TELEGRAM_CHAT_ID')
-        self.test_connection()
     
     def test_connection(self):
         """Проверка подключения к Telegram API"""
         try:
             if not self.token:
-                print("⚠️ TELEGRAM_BOT_TOKEN не установлен")
+                logger.warning("TELEGRAM_BOT_TOKEN не установлен")
                 return False
                 
             url = f"https://api.telegram.org/bot{self.token}/getMe"
@@ -40,20 +52,20 @@ class TelegramStorage:
             if response.status_code == 200:
                 data = response.json()
                 if data.get('ok'):
-                    print(f"✅ Бот подключен: {data['result']['first_name']}")
+                    logger.info(f"Бот подключен: {data['result']['first_name']}")
                     return True
                 else:
-                    print(f"❌ Ошибка бота: {data.get('description')}")
+                    logger.error(f"Ошибка бота: {data.get('description')}")
                     return False
             else:
-                print(f"❌ Ошибка HTTP: {response.status_code}")
+                logger.error(f"Ошибка HTTP: {response.status_code}")
                 return False
         except Exception as e:
-            print(f"❌ Ошибка подключения к Telegram: {e}")
+            logger.error(f"Ошибка подключения к Telegram: {e}")
             return False
     
     def upload_file(self, file_path, metadata=None):
-        """Загрузка файла в Telegram канал с inline-кнопкой"""
+        """Загрузка файла в Telegram канал"""
         try:
             if not self.token or not self.chat_id:
                 return {'success': False, 'error': 'Токен или chat_id не установлен'}
@@ -62,22 +74,23 @@ class TelegramStorage:
             
             # Подготавливаем метаданные для описания
             caption = self._format_caption(metadata) if metadata else "Документ из архива"
-
             
             with open(file_path, 'rb') as file:
                 files = {'document': file}
                 data = {
                     'chat_id': self.chat_id,
                     'caption': caption,
-                    'parse_mode': 'HTML',
+                    'parse_mode': 'HTML'
                 }
                 
+                logger.info(f"Отправка файла в Telegram: {file_path}")
                 response = requests.post(url, files=files, data=data, timeout=60)
                 result = response.json()
                 
                 if result.get('ok'):
                     message_id = result['result']['message_id']
                     file_id = result['result']['document']['file_id']
+                    logger.info(f"Файл успешно загружен в Telegram, message_id: {message_id}")
                     return {
                         'message_id': message_id,
                         'file_id': file_id,
@@ -85,11 +98,11 @@ class TelegramStorage:
                     }
                 else:
                     error_msg = result.get('description', 'Неизвестная ошибка')
-                    print(f"❌ Ошибка Telegram: {error_msg}")
+                    logger.error(f"Ошибка Telegram: {error_msg}")
                     return {'success': False, 'error': error_msg}
                     
         except Exception as e:
-            print(f"❌ Ошибка загрузки в Telegram: {e}")
+            logger.error(f"Ошибка загрузки в Telegram: {e}")
             return {'success': False, 'error': str(e)}
     
     def _format_caption(self, metadata):
@@ -112,32 +125,40 @@ class TelegramStorage:
             caption += f"👤 Отправитель: {metadata['sender']}\n"
         if metadata.get('executor'):
             caption += f"🛠️ Исполнитель: {metadata['executor']}\n"
-            
+
         return caption
     
-    def get_channel_files(self, limit=100):
-        """Получение списка файлов из канала"""
+    def download_file(self, file_id, destination_path):
+        """Скачивание файла из Telegram"""
         try:
-            url = f"https://api.telegram.org/bot{self.token}/getUpdates"
-            response = requests.get(url)
-            updates = response.json()
+            # Получаем информацию о файле
+            file_info_url = f"https://api.telegram.org/bot{self.token}/getFile?file_id={file_id}"
+            logger.info(f"Получение информации о файле: {file_id}")
+            file_info_response = requests.get(file_info_url)
+            file_info = file_info_response.json()
             
-            files = []
-            if updates.get('ok') and updates['result']:
-                for update in updates['result']:
-                    if 'message' in update and 'document' in update['message']:
-                        doc = update['message']['document']
-                        files.append({
-                            'file_id': doc['file_id'],
-                            'file_name': doc.get('file_name', 'unknown'),
-                            'caption': update['message'].get('caption', ''),
-                            'date': update['message']['date'],
-                            'message_id': update['message']['message_id']
-                        })
-            return files
+            if file_info.get('ok'):
+                file_path = file_info['result']['file_path']
+                download_url = f"https://api.telegram.org/file/bot{self.token}/{file_path}"
+                logger.info(f"Скачивание файла: {download_url}")
+                
+                # Скачиваем файл
+                response = requests.get(download_url)
+                if response.status_code == 200:
+                    with open(destination_path, 'wb') as f:
+                        f.write(response.content)
+                    logger.info(f"Файл успешно скачан: {destination_path}")
+                    return True
+                else:
+                    logger.error(f"Ошибка скачивания файла: {response.status_code}")
+                    return False
+            else:
+                logger.error(f"Ошибка получения информации о файле: {file_info}")
+                return False
+            
         except Exception as e:
-            print(f"❌ Ошибка получения файлов из канала: {e}")
-            return []
+            logger.error(f"Ошибка скачивания из Telegram: {e}")
+            return False
 
 class PreviewThread(QThread):
     preview_generated = pyqtSignal(str, object)
@@ -174,7 +195,6 @@ class PreviewThread(QThread):
         except Exception as e:
             print(f"Ошибка генерации превью в потоке: {e}")
             self.preview_generated.emit(self.file_path, "error")
-
 
 class PreviewManager:
     def __init__(self):
@@ -280,12 +300,13 @@ class SettingsDialog(QDialog):
         telegram_layout = QVBoxLayout(self.telegram_tab)
         
         telegram_info = QLabel(
-            "Для работы с Telegram Archive:\n"
+            "Для работы с Telegram:\n"
             "1. Создайте бота через @BotFather\n"
-            "2. Создайте канал и добавьте бота как администратора\n"
-            "3. Отправьте любое сообщение в канал\n"
+            "2. Создайте групповой чат и добавьте бота как администратора\n"
+            "3. Отправьте любое сообщение в чат\n"
             "4. Получите chat_id через @username_to_id_bot\n"
-            "5. Введите данные ниже:"
+            "5. Введите данные ниже:\n\n"
+            "⚠️ ВАЖНО: Бот должен быть администратором чата!"
         )
         telegram_info.setWordWrap(True)
         telegram_info.setStyleSheet("padding: 10px; background-color: #2b5278; border-radius: 5px; color: white;")
@@ -298,20 +319,23 @@ class SettingsDialog(QDialog):
         self.telegram_token_edit.setText(os.getenv('TELEGRAM_BOT_TOKEN', ''))
         
         self.telegram_chat_id_edit = QLineEdit()
-        self.telegram_chat_id_edit.setPlaceholderText("@channel_name или -1001234567890")
+        self.telegram_chat_id_edit.setPlaceholderText("-1234567890 (для групп) или @channel_name")
         self.telegram_chat_id_edit.setText(os.getenv('TELEGRAM_CHAT_ID', ''))
         
         telegram_form.addRow("Bot Token:", self.telegram_token_edit)
         telegram_form.addRow("Chat ID:", self.telegram_chat_id_edit)
         
+        btn_layout = QHBoxLayout()
         test_telegram_btn = QPushButton("Проверить подключение")
         test_telegram_btn.clicked.connect(self.test_telegram_connection)
         
+        btn_layout.addWidget(test_telegram_btn)
+        
         telegram_layout.addLayout(telegram_form)
-        telegram_layout.addWidget(test_telegram_btn)
+        telegram_layout.addLayout(btn_layout)
         telegram_layout.addStretch()
         
-        # Вкладки отправителей и исполнителей (остаются без изменений)
+        # Вкладки отправителей и исполнителей
         self.senders_tab = QWidget()
         self.senders_layout = QVBoxLayout(self.senders_tab)
         
@@ -354,7 +378,7 @@ class SettingsDialog(QDialog):
         self.executors_layout.addWidget(self.executors_table)
         self.executors_layout.addLayout(btn_layout)
         
-        tabs.addTab(self.telegram_tab, "Telegram Archive")
+        tabs.addTab(self.telegram_tab, "Telegram")
         tabs.addTab(self.senders_tab, "Отправители")
         tabs.addTab(self.executors_tab, "Исполнители")
         
@@ -368,13 +392,14 @@ class SettingsDialog(QDialog):
         token = self.telegram_token_edit.text().strip()
         chat_id = self.telegram_chat_id_edit.text().strip()
         
-        if not token or not chat_id:
-            QMessageBox.warning(self, "Ошибка", "Введите token и chat_id")
+        if not token:
+            QMessageBox.warning(self, "Ошибка", "Введите token")
             return
         
         # Сохраняем временно в переменные окружения для теста
         os.environ['TELEGRAM_BOT_TOKEN'] = token
-        os.environ['TELEGRAM_CHAT_ID'] = chat_id
+        if chat_id:
+            os.environ['TELEGRAM_CHAT_ID'] = chat_id
         
         storage = TelegramStorage()
         if storage.test_connection():
@@ -538,7 +563,7 @@ class SettingsDialog(QDialog):
         token = self.telegram_token_edit.text().strip()
         chat_id = self.telegram_chat_id_edit.text().strip()
         
-        if token and chat_id:
+        if token:
             # Обновляем .env файл
             env_lines = []
             if os.path.exists('.env'):
@@ -546,17 +571,19 @@ class SettingsDialog(QDialog):
                     env_lines = f.readlines()
             
             # Обновляем или добавляем переменные
-            updated = False
+            updated_token = False
+            updated_chat_id = False
             for i, line in enumerate(env_lines):
                 if line.startswith('TELEGRAM_BOT_TOKEN='):
                     env_lines[i] = f'TELEGRAM_BOT_TOKEN={token}\n'
-                    updated = True
+                    updated_token = True
                 elif line.startswith('TELEGRAM_CHAT_ID='):
                     env_lines[i] = f'TELEGRAM_CHAT_ID={chat_id}\n'
-                    updated = True
+                    updated_chat_id = True
             
-            if not updated:
+            if not updated_token:
                 env_lines.append(f'TELEGRAM_BOT_TOKEN={token}\n')
+            if not updated_chat_id and chat_id:
                 env_lines.append(f'TELEGRAM_CHAT_ID={chat_id}\n')
             
             with open('.env', 'w', encoding='utf-8') as f:
@@ -564,10 +591,10 @@ class SettingsDialog(QDialog):
             
             # Обновляем переменные окружения
             os.environ['TELEGRAM_BOT_TOKEN'] = token
-            os.environ['TELEGRAM_CHAT_ID'] = chat_id
+            if chat_id:
+                os.environ['TELEGRAM_CHAT_ID'] = chat_id
         
         super().accept()
-
 
 class DocumentUploadDialog(QDialog):
     def __init__(self, doc_type, parent=None):
@@ -597,95 +624,10 @@ class DocumentUploadDialog(QDialog):
             "doc_date": self.doc_date.text().strip()
         }
 
-class SyncTelegramThread(QThread):
-    progress = pyqtSignal(str)
-    finished = pyqtSignal(bool, str)
-    
-    def __init__(self, telegram_storage, data_file, base_dir):
-        super().__init__()
-        self.telegram_storage = telegram_storage
-        self.data_file = data_file
-        self.base_dir = base_dir
-    
-    def run(self):
-        """Синхронизация документов с Telegram архивом"""
-        try:
-            self.progress.emit("🔄 Начало синхронизации с Telegram...")
-            
-            # Загружаем текущие данные
-            with open(self.data_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            local_docs = {doc['filename']: doc for doc in data['documents']}
-            
-            self.progress.emit("📡 Получение списка файлов из Telegram...")
-            telegram_files = self.telegram_storage.get_channel_files()
-            
-            new_docs_count = 0
-            for tg_file in telegram_files:
-                filename = tg_file['file_name']
-                
-                # Проверяем, есть ли файл в локальной базе
-                if filename not in local_docs:
-                    self.progress.emit(f"📥 Загрузка нового файла: {filename}")
-                    
-                    # Создаем временный путь для загрузки
-                    temp_path = os.path.join(self.base_dir, "temp", filename)
-                    os.makedirs(os.path.dirname(temp_path), exist_ok=True)
-                    
-                    # Скачиваем файл
-                    if self.telegram_storage.download_file(tg_file['file_id'], temp_path):
-                        # Определяем тип документа из caption
-                        caption = tg_file.get('caption', '')
-                        doc_type = 'incoming' if 'Входящий' in caption else 'outgoing'
-                        
-                        # Создаем запись документа
-                        new_doc = {
-                            'filename': filename,
-                            'type': doc_type,
-                            'path': temp_path,
-                            'telegram_file_id': tg_file['file_id'],
-                            'telegram_message_id': tg_file.get('message_id'),
-                            'date': datetime.fromtimestamp(tg_file['date']).strftime("%Y-%m-%d %H:%M:%S"),
-                            'size': os.path.getsize(temp_path)
-                        }
-                        
-                        # Извлекаем метаданные из caption
-                        if 'Номер:' in caption:
-                            import re
-                            number_match = re.search(r'Номер:\s*([^\n]+)', caption)
-                            if number_match:
-                                new_doc['doc_number'] = number_match.group(1).strip()
-                        
-                        if 'Отправитель:' in caption:
-                            sender_match = re.search(r'Отправитель:\s*([^\n]+)', caption)
-                            if sender_match:
-                                new_doc['sender'] = sender_match.group(1).strip()
-                        
-                        if 'Исполнитель:' in caption:
-                            executor_match = re.search(r'Исполнитель:\s*([^\n]+)', caption)
-                            if executor_match:
-                                new_doc['executor'] = executor_match.group(1).strip()
-                        
-                        data['documents'].append(new_doc)
-                        new_docs_count += 1
-            
-            if new_docs_count > 0:
-                # Сохраняем обновленные данные
-                with open(self.data_file, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, ensure_ascii=False, indent=4)
-                
-                self.finished.emit(True, f"✅ Синхронизация завершена! Добавлено {new_docs_count} новых документов")
-            else:
-                self.finished.emit(True, "ℹ️ Новых документов для синхронизации не найдено")
-                
-        except Exception as e:
-            self.finished.emit(False, f"❌ Ошибка синхронизации: {str(e)}")
-
 class DocumentManager(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Архив Telegram")
+        self.setWindowTitle("Архив документов")
         self.setGeometry(100, 100, 1000, 600)
         
         self.base_dir = os.path.join(os.path.dirname(__file__), "Документы архива")
@@ -812,51 +754,8 @@ class DocumentManager(QMainWindow):
             }
         """)    
 
-    def sync_with_telegram(self):
-        """Синхронизация с Telegram архивом"""
-        if not self.telegram_storage.test_connection():
-            QMessageBox.warning(self, "Ошибка", "❌ Не настроено подключение к Telegram")
-            return
-        
-        # Создаем диалог прогресса
-        progress_dialog = QDialog(self)
-        progress_dialog.setWindowTitle("Синхронизация с Telegram")
-        progress_dialog.setFixedSize(400, 150)
-        
-        layout = QVBoxLayout()
-        progress_dialog.setLayout(layout)
-        
-        progress_label = QLabel("Начало синхронизации...")
-        progress_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(progress_label)
-        
-        progress_dialog.show()
-        
-        # Запускаем поток синхронизации
-        self.sync_thread = SyncTelegramThread(
-            self.telegram_storage, 
-            self.data_file, 
-            self.base_dir
-        )
-        
-        self.sync_thread.progress.connect(progress_label.setText)
-        self.sync_thread.finished.connect(
-            lambda success, msg: self.on_sync_finished(success, msg, progress_dialog)
-        )
-        self.sync_thread.start()
-
-    def on_sync_finished(self, success, message, progress_dialog):
-        """Обработчик завершения синхронизации"""
-        progress_dialog.close()
-        
-        if success:
-            QMessageBox.information(self, "Синхронизация", message)
-            self.load_documents()
-        else:
-            QMessageBox.warning(self, "Ошибка синхронизации", message)
-
     def upload_to_telegram(self, file_path, doc_type, doc_data):
-        """Загрузка файла в Telegram канал с кнопкой скачивания"""
+        """Загрузка файла в Telegram канал"""
         try:
             if not self.telegram_storage.test_connection():
                 return False
@@ -875,14 +774,14 @@ class DocumentManager(QMainWindow):
             if result['success']:
                 doc_data['telegram_file_id'] = result['file_id']
                 doc_data['telegram_message_id'] = result['message_id']
-                print(f"✅ Документ загружен в Telegram с кнопкой скачивания (message_id: {result['message_id']})")
+                logger.info(f"Документ загружен в Telegram (message_id: {result['message_id']})")
                 return True
             else:
-                print(f"⚠️ Не удалось загрузить в Telegram: {result.get('error')}")
+                logger.warning(f"Не удалось загрузить в Telegram: {result.get('error')}")
                 return False
                 
         except Exception as e:
-            print(f"❌ Ошибка при загрузке в Telegram: {e}")
+            logger.error(f"Ошибка при загрузке в Telegram: {e}")
             return False
 
     def init_ui(self):
@@ -899,8 +798,7 @@ class DocumentManager(QMainWindow):
         left_layout = QVBoxLayout(left_panel)
         left_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        ######################
-        #png-шка в левой панели, многовероятно удалю в конце, но пока что пусть будет
+        # Логотип
         logo_label = QLabel()
         logo_pixmap = QPixmap("name.png")
 
@@ -912,10 +810,8 @@ class DocumentManager(QMainWindow):
             logo_label.setStyleSheet("background: transparent;")
             left_layout.addWidget(logo_label)
 
-        ###########################
-        
         # Заголовок
-        title_label = QLabel("Архив Telegram")
+        title_label = QLabel("Архив документов")
         title_label.setStyleSheet("""
             QLabel {
                 font-size: 16px;
@@ -931,29 +827,37 @@ class DocumentManager(QMainWindow):
         
         # Статус Telegram
         self.telegram_status_label = QLabel()
-        self.update_telegram_status()
         self.telegram_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.telegram_status_label.setMinimumHeight(50)
         self.telegram_status_label.setStyleSheet("""
             QLabel {
+                background-color: #c42b1c;
+                color: white;
                 font-size: 12px;
-                padding: 5px;
-                border-radius: 3px;
+                padding: 8px;
+                border-radius: 5px;
                 margin: 5px;
+                font-weight: bold;
             }
         """)
+        self.telegram_status_label.setText("❌ Telegram не подключен\n⚙️ Настройте подключение")
         left_layout.addWidget(self.telegram_status_label)
         
+        # Обновляем статус
+        self.update_telegram_status()
+
+        # Кнопки управления
         buttons = [
-            ("Загрузить документ", self.upload_document),
-            ("Удалить документ", self.delete_document),
-            ("Синхронизация с Telegram", self.sync_with_telegram)
+            ("Загрузить в Telegram", self.upload_document_to_telegram),
+            ("Загрузить локально", self.upload_document_local),
+            ("Удалить документ", self.delete_document)
         ]
         
         for text, handler in buttons:
             btn = QPushButton(text)
             btn.setStyleSheet("""
                 QPushButton {
-                    background-color: %s;
+                    background-color: #4a6fa5;
                     color: white;
                     border: none;
                     padding: 10px;
@@ -962,54 +866,46 @@ class DocumentManager(QMainWindow):
                     margin-top: 10px;
                 }
                 QPushButton:hover {
-                    background-color: %s;
+                    background-color: #5a7fb5;
                 }
                 QPushButton:pressed {
-                    background-color: %s;
+                    background-color: #3a5f95;
                 }
-            """ % (
-                "#5a5a5a" if text == "Настройки" else "#4a6fa5",
-                "#6a6a6a" if text == "Настройки" else "#5a7fb5",
-                "#4a4a4a" if text == "Настройки" else "#3a5f95"
-            ))
+            """)
             btn.setFixedHeight(40)
             btn.clicked.connect(handler)
             left_layout.addWidget(btn)
 
         left_layout.addStretch()
-        buttons = [
-            ("Настройки", self.open_settings)
-        ]
-        for text, handler in buttons:
-            btn = QPushButton(text)
-            btn.setStyleSheet("""
-                QPushButton {
-                    background-color: %s;
-                    color: white;
-                    border: none;
-                    padding: 10px;
-                    border-radius: 5px;
-                    font-weight: bold;
-                    margin-top: 10px;
-                }
-                QPushButton:hover {
-                    background-color: %s;
-                }
-                QPushButton:pressed {
-                    background-color: %s;
-                }
-            """ % (
-                "#5a5a5a" if text == "Настройки" else "#4a6fa5",
-                "#6a6a6a" if text == "Настройки" else "#5a7fb5",
-                "#4a4a4a" if text == "Настройки" else "#3a5f95"
-            ))
-            btn.setFixedHeight(40)
-            btn.clicked.connect(handler)
-            left_layout.addWidget(btn)
 
+        # Кнопка настроек
+        settings_btn = QPushButton("Настройки")
+        settings_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #5a5a5a;
+                color: white;
+                border: none;
+                padding: 10px;
+                border-radius: 5px;
+                font-weight: bold;
+                margin-top: 10px;
+            }
+            QPushButton:hover {
+                background-color: #6a6a6a;
+            }
+            QPushButton:pressed {
+                background-color: #4a4a4a;
+            }
+        """)
+        settings_btn.setFixedHeight(40)
+        settings_btn.clicked.connect(self.open_settings)
+        left_layout.addWidget(settings_btn)
+
+        # Центральная панель - список документов
         center_panel = QWidget()
         center_layout = QVBoxLayout(center_panel)
         
+        # Панель фильтров
         filter_panel = QWidget()
         filter_layout = QHBoxLayout(filter_panel)
         
@@ -1026,6 +922,7 @@ class DocumentManager(QMainWindow):
         
         center_layout.addWidget(filter_panel)
         
+        # Список документов
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setStyleSheet("""
@@ -1070,10 +967,12 @@ class DocumentManager(QMainWindow):
         
         center_layout.addWidget(scroll_area)
         
+        # Правая панель - превью и информация
         right_panel = QWidget()
         right_panel.setFixedWidth(350)
         right_layout = QVBoxLayout(right_panel)
         
+        # Превью документа
         self.preview_widget = QLabel()
         self.preview_widget.setFixedSize(300, 300)
         self.preview_widget.setStyleSheet("""
@@ -1086,6 +985,7 @@ class DocumentManager(QMainWindow):
         self.preview_widget.setAlignment(Qt.AlignmentFlag.AlignCenter)
         right_layout.addWidget(self.preview_widget)
         
+        # Информация о документе
         info_title = QLabel("Информация о документе")
         info_title.setStyleSheet("""
             QLabel {
@@ -1116,6 +1016,7 @@ class DocumentManager(QMainWindow):
             ("Размер", "size_label"),
             ("Путь", "path_label"),
             ("Дата добавления", "date_label"),
+            ("Telegram ID", "telegram_id_label")
         ]
         
         for field_name, field_var in fields:
@@ -1147,6 +1048,7 @@ class DocumentManager(QMainWindow):
         right_layout.addWidget(self.info_widget)
         right_layout.addStretch()
         
+        # Добавляем все панели в главный layout
         main_layout.addWidget(left_panel)
         main_layout.addWidget(center_panel)
         main_layout.addWidget(right_panel)
@@ -1180,19 +1082,23 @@ class DocumentManager(QMainWindow):
                     background-color: #2d7d46;
                     color: white;
                     font-size: 12px;
-                    padding: 5px;
-                    border-radius: 3px;
+                    padding: 8px;
+                    border-radius: 5px;
+                    margin: 5px;
+                    font-weight: bold;
                 }
             """)
         else:
-            self.telegram_status_label.setText("❌ Telegram отключен")
+            self.telegram_status_label.setText("❌ Telegram не подключен\n⚙️ Настройте подключение")
             self.telegram_status_label.setStyleSheet("""
                 QLabel {
                     background-color: #c42b1c;
                     color: white;
                     font-size: 12px;
-                    padding: 5px;
-                    border-radius: 3px;
+                    padding: 8px;
+                    border-radius: 5px;
+                    margin: 5px;
+                    font-weight: bold;
                 }
             """)
     
@@ -1204,7 +1110,7 @@ class DocumentManager(QMainWindow):
         self.load_documents()
     
     def apply_filters(self):
-        """фильтр поиска с учетом всех полей документа"""
+        """Фильтр поиска с учетом всех полей документа"""
         search_text = self.search_edit.text().lower()
         filter_type = self.filter_combo.currentText()
         
@@ -1213,7 +1119,7 @@ class DocumentManager(QMainWindow):
             doc = item.data(Qt.ItemDataRole.UserRole)
             visible = True
             
-            # поиск по всем полям документа
+            # Поиск по всем полям документа
             if search_text:
                 search_fields = [
                     doc["filename"].lower(),
@@ -1246,7 +1152,7 @@ class DocumentManager(QMainWindow):
             
             # Устанавливаем иконку в зависимости от типа и наличия в Telegram
             if doc.get('telegram_file_id'):
-                item.setIcon(QIcon.fromTheme("cloud-upload"))  # Иконка облака если есть в Telegram
+                item.setIcon(QIcon.fromTheme("cloud-upload"))
                 item.setForeground(Qt.GlobalColor.green)
             else:
                 item.setForeground(Qt.GlobalColor.white)
@@ -1260,8 +1166,17 @@ class DocumentManager(QMainWindow):
             
             self.documents_list.addItem(item)
 
-    def upload_document(self):
-        """Загрузка нового документа"""
+    def upload_document_to_telegram(self):
+        """Загрузка документа с отправкой в Telegram"""
+        self._upload_document(upload_to_telegram=True)
+    
+    def upload_document_local(self):
+        """Загрузка документа только локально"""
+        self._upload_document(upload_to_telegram=False)
+
+    def _upload_document(self, upload_to_telegram=True):
+        """Общий метод загрузки документа"""
+        # Выбор типа документа
         type_dialog = QDialog(self)
         type_dialog.setWindowTitle("Выберите тип документа")
         type_dialog.setFixedSize(300, 150)
@@ -1273,18 +1188,26 @@ class DocumentManager(QMainWindow):
         incoming_btn = QPushButton("Входящее письмо")
         outgoing_btn = QPushButton("Исходящее письмо")
         
-        incoming_btn.clicked.connect(lambda: self.process_document_upload("incoming", type_dialog))
-        outgoing_btn.clicked.connect(lambda: self.process_document_upload("outgoing", type_dialog))
+        incoming_btn.clicked.connect(lambda: self.process_document_upload("incoming", type_dialog, upload_to_telegram))
+        outgoing_btn.clicked.connect(lambda: self.process_document_upload("outgoing", type_dialog, upload_to_telegram))
         
         layout.addWidget(label)
         layout.addWidget(incoming_btn)
         layout.addWidget(outgoing_btn)
         
         type_dialog.exec()
-    
-    def process_document_upload(self, doc_type, type_dialog):
+
+    def process_document_upload(self, doc_type, type_dialog, upload_to_telegram):
         """Полная обработка загрузки документа"""
+        # Закрываем диалог выбора типа документа
         type_dialog.close()
+        
+        # Проверка подключения к Telegram если требуется загрузка в Telegram
+        if upload_to_telegram and not self.telegram_storage.test_connection():
+            QMessageBox.warning(self, "Ошибка", 
+                            "❌ Не настроено подключение к Telegram\n\n"
+                            "Для загрузки в Telegram необходимо настроить подключение в настройках.")
+            return
         
         # 1. Выбор файла
         file_path, _ = QFileDialog.getOpenFileName(
@@ -1297,7 +1220,7 @@ class DocumentManager(QMainWindow):
         if not file_path:
             return
         
-        # 2. Запрос дополнительных данных
+        # 2. Запрос дополнительных данных документа
         upload_dialog = DocumentUploadDialog(doc_type, self)
         if upload_dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -1310,13 +1233,15 @@ class DocumentManager(QMainWindow):
         filename = os.path.basename(file_path)
         data = self.load_data()
         
-        # Проверка на дубликат
+        # 3. Проверка на дубликат
         for doc in data['documents']:
-            if doc['filename'].lower() == filename.lower() and doc['type'] == doc_type:
-                QMessageBox.warning(self, "Ошибка", "Документ с таким именем и типом уже существует")
+            if (doc['filename'].lower() == filename.lower() and 
+                doc['type'] == doc_type and 
+                doc.get('doc_number') == doc_details['doc_number']):
+                QMessageBox.warning(self, "Ошибка", "Документ с таким именем, типом и номером уже существует")
                 return
         
-        # 3. Подготовка данных документа
+        # 4. Подготовка данных документа
         doc_data = {
             'filename': filename,
             'type': doc_type,
@@ -1327,14 +1252,25 @@ class DocumentManager(QMainWindow):
         }
 
         try:
-            # 4. Обработка в зависимости от типа документа
+            # 5. Обработка в зависимости от типа документа
+            local_path = None
+            
             if doc_type == "incoming":
+                # Выбор или создание отправителя
                 sender = self.select_or_create_entity("sender", "Выберите отправителя", "Создать нового отправителя")
                 if not sender:
-                    return
+                    return  # Пользователь отменил выбор
                 
                 doc_data['sender'] = sender
-                doc_data['sender_id'] = next(s["id"] for s in data["senders"] if s["name"] == sender)
+                
+                # Обновляем данные чтобы получить актуальный список отправителей
+                data = self.load_data()
+                sender_obj = next((s for s in data["senders"] if s["name"] == sender), None)
+                if sender_obj:
+                    doc_data['sender_id'] = sender_obj["id"]
+                else:
+                    # Если отправитель не найден (крайне маловероятно), создаем временный ID
+                    doc_data['sender_id'] = max(s["id"] for s in data["senders"]) + 1 if data["senders"] else 1
                 
                 # Создание папки отправителя локально
                 sender_dir = os.path.join(self.incoming_dir, sender)
@@ -1345,12 +1281,21 @@ class DocumentManager(QMainWindow):
                 shutil.copy2(file_path, local_path)
                 
             elif doc_type == "outgoing":
+                # Выбор или создание исполнителя
                 executor = self.select_or_create_entity("executor", "Выберите исполнителя", "Создать нового исполнителя")
                 if not executor:
-                    return
+                    return  # Пользователь отменил выбор
                 
                 doc_data['executor'] = executor
-                doc_data['executor_id'] = next(e["id"] for e in data["executors"] if e["name"] == executor)
+                
+                # Обновляем данные чтобы получить актуальный список исполнителей
+                data = self.load_data()
+                executor_obj = next((e for e in data["executors"] if e["name"] == executor), None)
+                if executor_obj:
+                    doc_data['executor_id'] = executor_obj["id"]
+                else:
+                    # Если исполнитель не найден (крайне маловероятно), создаем временный ID
+                    doc_data['executor_id'] = max(e["id"] for e in data["executors"]) + 1 if data["executors"] else 1
                 
                 # Создание папки исполнителя локально
                 executor_dir = os.path.join(self.executors_dir, executor)
@@ -1360,44 +1305,67 @@ class DocumentManager(QMainWindow):
                 local_path = os.path.join(executor_dir, filename)
                 shutil.copy2(file_path, local_path)
             
-            # 5. Сохраняем локальный путь
+            # 6. Проверяем что файл был успешно скопирован
+            if not local_path or not os.path.exists(local_path):
+                raise Exception("Не удалось сохранить файл локально")
+            
+            # Сохраняем локальный путь
             doc_data['path'] = local_path
             
-            # 6. Загрузка в Telegram с кнопкой скачивания
-            telegram_success = self.upload_to_telegram(local_path, doc_type, doc_data)
-            if telegram_success:
-                print("✅ Документ успешно загружен в Telegram")
-            else:
-                print("⚠️ Документ не был загружен в Telegram")
+            # 7. Загрузка в Telegram если требуется
+            telegram_success = False
+            if upload_to_telegram:
+                telegram_success = self.upload_to_telegram(local_path, doc_type, doc_data)
+                if telegram_success:
+                    logger.info(f"✅ Документ успешно загружен в Telegram: {filename}")
+                else:
+                    logger.warning(f"⚠️ Документ не был загружен в Telegram: {filename}")
             
-            # 7. Сохранение в базу данных
+            # 8. Сохранение в базу данных
+            data = self.load_data()  # Перезагружаем данные на случай изменений
             data['documents'].append(doc_data)
             self.save_data(data)
             
-            # 8. Обновление интерфейса
+            # 9. Обновление интерфейса
             self.load_documents()
             
-            message = f"Документ успешно загружен:\nНомер: {doc_details['doc_number']}\nДата: {doc_details['doc_date']}\nРазмер: {doc_data['size']/1024:.1f} KB"
-            if telegram_success:
-                message += "\n✅ Загружено в Telegram"
+            # 10. Показываем сообщение об успехе
+            size_kb = doc_data['size'] / 1024
+            message = (f"Документ успешно загружен:\n"
+                    f"📄 Файл: {filename}\n"
+                    f"🔢 Номер: {doc_details['doc_number']}\n"
+                    f"📅 Дата: {doc_details['doc_date']}\n"
+                    f"💾 Размер: {size_kb:.1f} KB")
+            
+            if upload_to_telegram:
+                if telegram_success:
+                    message += "\n✅ Загружено в Telegram"
+                else:
+                    message += "\n⚠️ Не загружено в Telegram (проверьте настройки)"
             else:
-                message += "\n⚠️ Не загружено в Telegram"
+                message += "\n📁 Только локальная копия"
             
             QMessageBox.information(self, "Успешно", message)
             
         except Exception as e:
             # Удаляем временные файлы в случае ошибки
-            if 'local_path' in locals() and os.path.exists(local_path):
-                os.remove(local_path)
-                
+            if local_path and os.path.exists(local_path):
+                try:
+                    os.remove(local_path)
+                    logger.info(f"Удален временный файл после ошибки: {local_path}")
+                except Exception as cleanup_error:
+                    logger.error(f"Ошибка при удалении временного файла: {cleanup_error}")
+            
+            error_message = f"Не удалось загрузить документ:\n{str(e)}"
+            logger.error(error_message)
             QMessageBox.critical(
                 self,
-                "Ошибка",
-                f"Не удалось загрузить документ:\n{str(e)}"
+                "Ошибка загрузки",
+                error_message
             )
         
     def select_or_create_entity(self, entity_type, select_title, create_title):
-        """Выбор или создание отправителя/исполнителя"""
+        """Выбор или создание отправителя/исполнителя без прерывания процесса загрузки"""
         data = self.load_data()
         entities = data[f"{entity_type}s"]
         
@@ -1412,15 +1380,44 @@ class DocumentManager(QMainWindow):
         for entity in entities:
             entity_list.addItem(entity["name"])
         
-        # Кнопочки
+        # Кнопки
         btn_layout = QHBoxLayout()
         select_btn = QPushButton("Выбрать")
         create_btn = QPushButton(create_title)
         cancel_btn = QPushButton("Отмена")
         
-        select_btn.clicked.connect(dialog.accept)
-        create_btn.clicked.connect(lambda: self.create_new_entity(entity_type, dialog))
-        cancel_btn.clicked.connect(dialog.reject)
+        # Временная переменная для хранения результата
+        selected_entity = [None]  # Используем список для передачи по ссылке
+        
+        def on_select():
+            if entity_list.currentItem():
+                selected_entity[0] = entity_list.currentItem().text()
+                dialog.accept()
+            else:
+                QMessageBox.warning(dialog, "Ошибка", "Выберите элемент из списка")
+        
+        def on_create():
+            # Создаем новую сущность без закрытия основного диалога
+            new_entity = self.create_new_entity_direct(entity_type, dialog)
+            if new_entity:
+                # Обновляем список в реальном времени
+                entity_list.clear()
+                updated_data = self.load_data()
+                for entity in updated_data[f"{entity_type}s"]:
+                    entity_list.addItem(entity["name"])
+                # Автоматически выбираем новосозданную сущность
+                for i in range(entity_list.count()):
+                    if entity_list.item(i).text() == new_entity:
+                        entity_list.setCurrentRow(i)
+                        break
+        
+        def on_cancel():
+            selected_entity[0] = None
+            dialog.reject()
+        
+        select_btn.clicked.connect(on_select)
+        create_btn.clicked.connect(on_create)
+        cancel_btn.clicked.connect(on_cancel)
         
         btn_layout.addWidget(select_btn)
         btn_layout.addWidget(create_btn)
@@ -1430,15 +1427,13 @@ class DocumentManager(QMainWindow):
         layout.addLayout(btn_layout)
         
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            if entity_list.currentItem():
-                return entity_list.currentItem().text()
+            return selected_entity[0]
         
         return None
     
-    def create_new_entity(self, entity_type, parent_dialog):
-        parent_dialog.close()
-        
-        dialog = QDialog(self)
+    def create_new_entity_direct(self, entity_type, parent_dialog=None):
+        """Создание нового отправителя/исполнителя без диалога выбора"""
+        dialog = QDialog(parent_dialog or self)
         dialog.setWindowTitle(f"Создать нового {entity_type}")
         dialog.setFixedSize(300, 150)
         
@@ -1460,19 +1455,20 @@ class DocumentManager(QMainWindow):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             name = name_edit.text().strip()
             if not name:
-                QMessageBox.warning(self, "Ошибка", "Имя не может быть пустым")
+                QMessageBox.warning(parent_dialog or self, "Ошибка", "Имя не может быть пустым")
                 return None
             
             data = self.load_data()
             entities = data[f"{entity_type}s"]
             
-            # Проверяем
+            # Проверяем на дубликат
             if any(e["name"].lower() == name.lower() for e in entities):
-                QMessageBox.warning(self, "Ошибка", f"{entity_type} с таким именем уже существует")
+                QMessageBox.warning(parent_dialog or self, "Ошибка", f"{entity_type} с таким именем уже существует")
                 return None
             
+            new_id = max(e["id"] for e in entities) + 1 if entities else 1
             new_entity = {
-                "id": len(entities) + 1,
+                "id": new_id,
                 "name": name,
                 "description": description_edit.text(),
                 "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1481,6 +1477,7 @@ class DocumentManager(QMainWindow):
             entities.append(new_entity)
             self.save_data(data)
             
+            # Создаем папку для сущности
             if entity_type == "executor":
                 executor_dir = os.path.join(self.executors_dir, name)
                 os.makedirs(executor_dir, exist_ok=True)
@@ -1505,7 +1502,7 @@ class DocumentManager(QMainWindow):
         reply = QMessageBox.question(
             self, 
             'Подтверждение', 
-            f'Вы уверены что хотите удалить файл {filename}?\n\n⚠️ Внимание: файл будет удален только локально, в Telegram он останется.', 
+            f'Вы уверены что хотите удалить файл {filename}?\n\n⚠️ Внимание: файл будет удален только локально.', 
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         
@@ -1527,7 +1524,6 @@ class DocumentManager(QMainWindow):
             
             self.load_documents()
             self.clear_document_info()
-            QMessageBox.information(self, "Успешно", f"Файл успешно удален")
             
         except Exception as e:
             QMessageBox.warning(self, "Ошибка", f"Не удалось удалить файл: {str(e)}")
@@ -1544,45 +1540,14 @@ class DocumentManager(QMainWindow):
         
         # Проверяем существование файла
         if not os.path.exists(file_path):
-            # Пытаемся скачать из Telegram если есть file_id
-            if doc.get('telegram_file_id'):
-                reply = QMessageBox.question(
-                    self,
-                    "Файл не найден",
-                    f"Локальный файл {doc['filename']} не найден.\nХотите скачать его из Telegram?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-                )
-                
-                if reply == QMessageBox.StandardButton.Yes:
-                    # Скачиваем из Telegram
-                    temp_dir = os.path.join(self.base_dir, "temp")
-                    os.makedirs(temp_dir, exist_ok=True)
-                    temp_path = os.path.join(temp_dir, doc['filename'])
-                    
-                    if self.telegram_storage.download_file(doc['telegram_file_id'], temp_path):
-                        # Обновляем путь в базе
-                        data = self.load_data()
-                        for d in data['documents']:
-                            if (d['filename'] == doc['filename'] and 
-                                d.get('type') == doc.get('type') and 
-                                d.get('doc_number') == doc.get('doc_number')):
-                                d['path'] = temp_path
-                                break
-                        
-                        self.save_data(data)
-                        file_path = temp_path
-                    else:
-                        QMessageBox.warning(self, "Ошибка", "Не удалось скачать файл из Telegram")
-                        return
-            else:
-                QMessageBox.warning(self, "Ошибка", f"Файл {doc['filename']} не найден")
-                return
+            QMessageBox.warning(self, "Ошибка", f"Файл {doc['filename']} не найден")
+            return
         
         self.open_thread = OpenFileThread(file_path)
         self.open_thread.start()
 
     def show_document_info(self, item):
-        """информация о документе и его превью"""
+        """Отображение информации о документе и его превью"""
         if not item:
             return
             
@@ -1621,6 +1586,7 @@ class DocumentManager(QMainWindow):
             self.executor_label.setText(executor)
             self.size_label.setText(size_text)
             self.date_label.setText(date_added)
+            self.telegram_id_label.setText(telegram_id if telegram_id != "-" else "Не загружен")
             
             self.update_preview(path)
             
@@ -1634,6 +1600,7 @@ class DocumentManager(QMainWindow):
             self.clear_preview()
 
     def resizeEvent(self, event):
+        """Обработчик изменения размера окна"""
         super().resizeEvent(event)
         if hasattr(self, 'documents_list') and self.documents_list.currentItem():
             current_item = self.documents_list.currentItem()
@@ -1652,6 +1619,7 @@ class DocumentManager(QMainWindow):
                         self.preview_widget.setPixmap(scaled_pixmap)
 
     def clear_document_info(self):
+        """Очистка информации о документе"""
         self.name_label.setText("-")
         self.type_label.setText("-")
         self.sender_label.setText("-")
@@ -1663,13 +1631,9 @@ class DocumentManager(QMainWindow):
         self.doc_date_label.setText("-")
         self.telegram_id_label.setText("-")
         self.clear_preview()
-                
-    def show_full_path(self):
-        if hasattr(self, 'documents_list') and self.documents_list.currentItem():
-            doc = self.documents_list.currentItem().data(Qt.ItemDataRole.UserRole)
-            QMessageBox.information(self, "Полный путь", doc["path"])
     
     def migrate_data(self):
+        """Миграция данных"""
         data = self.load_data()
         changed = False
         
