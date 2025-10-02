@@ -7,16 +7,12 @@ import shutil
 from PIL import Image
 from datetime import datetime
 from dotenv import load_dotenv
-import webbrowser
 import tempfile
-import io
 import requests
-import urllib.parse
-import time
 import logging
 # весь наш интерфейс, сложно но можно
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
-from PyQt6.QtGui import QPixmap, QIcon, QFontMetrics
+from PyQt6.QtGui import QPixmap, QIcon, QFontMetrics, QPalette, QColor
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget, QListWidget, 
                             QPushButton, QFileDialog, QMessageBox, QLabel, QHBoxLayout,
                             QScrollArea, QListWidgetItem, QSizePolicy, QComboBox, 
@@ -257,6 +253,63 @@ class SettingsDialog(QDialog):
         self.load_data()
     
     def init_ui(self):
+        # Устанавливаем стиль для диалога
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #2b2b2b;
+                color: #ffffff;
+            }
+            QLabel {
+                color: #ffffff;
+            }
+            QLineEdit, QComboBox, QTextEdit, QListWidget, QTableWidget {
+                background-color: #353535;
+                color: #ffffff;
+                border: 1px solid #555555;
+                border-radius: 3px;
+                padding: 5px;
+            }
+            QTableWidget::item {
+                background-color: #353535;
+                color: #ffffff;
+            }
+            QTableWidget::item:selected {
+                background-color: #4a6fa5;
+            }
+            QHeaderView::section {
+                background-color: #454545;
+                color: white;
+                padding: 5px;
+                border: none;
+            }
+            QTabWidget::pane {
+                border: 1px solid #555555;
+                background-color: #353535;
+            }
+            QTabBar::tab {
+                background-color: #454545;
+                color: #ffffff;
+                padding: 8px 15px;
+            }
+            QTabBar::tab:selected {
+                background-color: #4a6fa5;
+            }
+            QPushButton {
+                background-color: #4a6fa5;
+                color: white;
+                border: none;
+                padding: 8px 15px;
+                border-radius: 5px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #5a7fb5;
+            }
+            QPushButton:pressed {
+                background-color: #3a5f95;
+            }
+        """)
+        
         layout = QVBoxLayout()
         self.setLayout(layout)
         
@@ -595,7 +648,36 @@ class DocumentUploadDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(f"Детали {'входящего' if doc_type == 'incoming' else 'исходящего'} письма")
         self.setFixedSize(300, 200)
-        
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #2b2b2b;
+                color: #ffffff;
+            }
+            QLabel {
+                color: #ffffff;
+            }
+            QLineEdit {
+                background-color: #353535;
+                color: #ffffff;
+                border: 1px solid #555555;
+                border-radius: 3px;
+                padding: 5px;
+            }
+            QPushButton {
+                background-color: #4a6fa5;
+                color: white;
+                border: none;
+                padding: 8px 15px;
+                border-radius: 5px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #5a7fb5;
+            }
+            QPushButton:pressed {
+                background-color: #3a5f95;
+            }
+        """)
         layout = QFormLayout()
         self.setLayout(layout)
         
@@ -625,14 +707,10 @@ class DocumentManager(QMainWindow):
         self.setGeometry(100, 100, 1000, 600)
         
         self.base_dir = os.path.join(os.path.dirname(__file__), "Документы архива")
-        self.documents_dir = os.path.join(self.base_dir, "Документы")
-        self.incoming_dir = os.path.join(self.base_dir, "Входящее")
-        self.outgoing_dir = os.path.join(self.base_dir, "Исходящее")
-        self.executors_dir = os.path.join(self.base_dir, "Исполнители")
+        self.incoming_dir = os.path.join(self.base_dir, "Входящие документы")
+        self.executors_dir = os.path.join(self.base_dir, "Исходящие документы")
         
-        os.makedirs(self.documents_dir, exist_ok=True)
         os.makedirs(self.incoming_dir, exist_ok=True)
-        os.makedirs(self.outgoing_dir, exist_ok=True)
         os.makedirs(self.executors_dir, exist_ok=True)
         
         self.data_file = os.path.join(self.base_dir, "data.json")
@@ -1175,6 +1253,33 @@ class DocumentManager(QMainWindow):
         type_dialog.setWindowTitle("Выберите тип документа")
         type_dialog.setFixedSize(300, 150)
         
+        # Обновляем стиль для единообразия
+        type_dialog.setStyleSheet("""
+            QDialog {
+                background-color: #2b2b2b;
+                color: #ffffff;
+            }
+            QLabel {
+                color: #ffffff;
+                padding: 10px;
+            }
+            QPushButton {
+                background-color: #4a6fa5;
+                color: white;
+                border: none;
+                padding: 10px;
+                border-radius: 5px;
+                font-weight: bold;
+                margin: 5px;
+            }
+            QPushButton:hover {
+                background-color: #5a7fb5;
+            }
+            QPushButton:pressed {
+                background-color: #3a5f95;
+            }
+        """)
+        
         layout = QVBoxLayout()
         type_dialog.setLayout(layout)
         
@@ -1251,7 +1356,7 @@ class DocumentManager(QMainWindow):
             
             if doc_type == "incoming":
                 # Выбор или создание отправителя
-                sender = self.select_or_create_entity("sender", "Выберите отправителя", "Создать нового отправителя")
+                sender = self.select_or_create_entity("sender", "Выберите отправителя", "Новый")
                 if not sender:
                     return  # Пользователь отменил выбор
                 
@@ -1276,7 +1381,7 @@ class DocumentManager(QMainWindow):
                 
             elif doc_type == "outgoing":
                 # Выбор или создание исполнителя
-                executor = self.select_or_create_entity("executor", "Выберите исполнителя", "Создать нового исполнителя")
+                executor = self.select_or_create_entity("executor", "Выберите исполнителя", "Новый")
                 if not executor:
                     return  # Пользователь отменил выбор
                 
@@ -1367,6 +1472,35 @@ class DocumentManager(QMainWindow):
         dialog.setWindowTitle(select_title)
         dialog.setFixedSize(300, 200)
         
+        # Обновляем стиль для единообразия
+        dialog.setStyleSheet("""
+            QDialog {
+                background-color: #2b2b2b;
+                color: #ffffff;
+            }
+            QListWidget {
+                background-color: #353535;
+                color: #ffffff;
+                border: 1px solid #555555;
+                border-radius: 3px;
+            }
+            QPushButton {
+                background-color: #4a6fa5;
+                color: white;
+                border: none;
+                padding: 8px 15px;
+                border-radius: 5px;
+                font-weight: bold;
+                margin: 2px;
+            }
+            QPushButton:hover {
+                background-color: #5a7fb5;
+            }
+            QPushButton:pressed {
+                background-color: #3a5f95;
+            }
+        """)
+        
         layout = QVBoxLayout()
         dialog.setLayout(layout)
         
@@ -1431,14 +1565,51 @@ class DocumentManager(QMainWindow):
         dialog.setWindowTitle(f"Создать нового {entity_type}")
         dialog.setFixedSize(300, 150)
         
+        # Обновляем стиль для единообразия
+        dialog.setStyleSheet("""
+            QDialog {
+                background-color: #2b2b2b;
+                color: #ffffff;
+            }
+            QLabel {
+                color: #ffffff;
+            }
+            QLineEdit {
+                background-color: #353535;
+                color: #ffffff;
+                border: 1px solid #555555;
+                border-radius: 3px;
+                padding: 5px;
+            }
+            QPushButton {
+                background-color: #4a6fa5;
+                color: white;
+                border: none;
+                padding: 8px 15px;
+                border-radius: 5px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #5a7fb5;
+            }
+            QPushButton:pressed {
+                background-color: #3a5f95;
+            }
+        """)
+        
         layout = QFormLayout()
         dialog.setLayout(layout)
         
         name_edit = QLineEdit()
         description_edit = QLineEdit()
         
-        layout.addRow("Имя:", name_edit)
-        layout.addRow("Описание:", description_edit)
+        name_label = QLabel("Имя:")
+        name_label.setStyleSheet("color: #ffffff;")
+        desc_label = QLabel("Описание:")
+        desc_label.setStyleSheet("color: #ffffff;")
+        
+        layout.addRow(name_label, name_edit)
+        layout.addRow(desc_label, description_edit)
         
         button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         button_box.accepted.connect(dialog.accept)
