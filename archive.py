@@ -11,14 +11,21 @@ import tempfile
 import requests
 import logging
 # весь наш интерфейс, сложно но можно
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
-from PyQt6.QtGui import QPixmap, QIcon, QFontMetrics, QPalette, QColor
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer
+from PyQt6.QtGui import QPixmap, QIcon
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QVBoxLayout, QWidget, QListWidget, 
                             QPushButton, QFileDialog, QMessageBox, QLabel, QHBoxLayout,
                             QScrollArea, QListWidgetItem, QSizePolicy, QComboBox, 
                             QLineEdit, QDialog, QFormLayout, QDialogButtonBox, QTabWidget,
-                            QTableWidget, QTableWidgetItem, QHeaderView, QTextEdit)
+                            QTableWidget, QTableWidgetItem, QHeaderView, QTextEdit, QProgressBar)
+from urllib.parse import quote
+from telethon import TelegramClient
+from telethon.tl.types import InputMessagesFilterDocument, InputMessagesFilterPhotos
 load_dotenv()
+from telethon.errors import SessionPasswordNeededError
+import asyncio
+import qasync
+from qasync import QEventLoop, asyncSlot, asyncClose
 
 # Настройка логирования
 logging.basicConfig(
@@ -31,6 +38,748 @@ logging.basicConfig(
 )
 logger = logging.getLogger('TelegramSync')
 
+class TelegramSyncDialog(QDialog):
+    def __init__(self, document_manager):
+        super().__init__(document_manager)
+        self.document_manager = document_manager
+        self.setWindowTitle("Синхронизация с Telegram")
+        self.setFixedSize(500, 400)
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #2b2b2b;
+                color: #ffffff;
+            }
+            QLabel {
+                color: #ffffff;
+            }
+            QProgressBar {
+                border: 1px solid #555555;
+                border-radius: 5px;
+                background-color: #353535;
+                text-align: center;
+                color: white;
+            }
+            QProgressBar::chunk {
+                background-color: #4a6fa5;
+                border-radius: 4px;
+            }
+            QTextEdit {
+                background-color: #353535;
+                color: #ffffff;
+                border: 1px solid #555555;
+                border-radius: 3px;
+                padding: 5px;
+            }
+            QPushButton {
+                background-color: #4a6fa5;
+                color: white;
+                border: none;
+                padding: 8px 15px;
+                border-radius: 5px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #5a7fb5;
+            }
+            QPushButton:disabled {
+                background-color: #555555;
+                color: #888888;
+            }
+        """)
+        self.init_ui()
+    
+    def init_ui(self):
+        layout = QVBoxLayout()
+        self.setLayout(layout)
+        
+        # Информация
+        info_label = QLabel(
+            "Синхронизация загрузит документы из Telegram чата, которых нет в локальном архиве.\n\n"
+            "⚠️ Для работы требуется:\n"
+            "• Настроенный бот с правами администратора\n"
+            "• Доступ бота к истории сообщений\n"
+            "• Стабильное интернет-соединение"
+        )
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("padding: 10px; background-color: #2b5278; border-radius: 5px;")
+        layout.addWidget(info_label)
+        
+        # Статус
+        self.status_label = QLabel("Готов к синхронизации")
+        self.status_label.setStyleSheet("font-weight: bold; padding: 5px;")
+        layout.addWidget(self.status_label)
+        
+        # Прогресс
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+        
+        # Лог
+        self.log_text = QTextEdit()
+        self.log_text.setMaximumHeight(200)
+        self.log_text.setReadOnly(True)
+        layout.addWidget(self.log_text)
+        
+        # Кнопки
+        button_layout = QHBoxLayout()
+        self.sync_btn = QPushButton("Начать синхронизацию")
+        self.sync_btn.clicked.connect(self.start_sync)
+        
+        self.cancel_btn = QPushButton("Отмена")
+        self.cancel_btn.clicked.connect(self.reject)
+        
+        button_layout.addWidget(self.sync_btn)
+        button_layout.addWidget(self.cancel_btn)
+        layout.addLayout(button_layout)
+        
+        # Поток синхронизации
+        self.sync_thread = None
+    
+    def log(self, message):
+        """Добавление сообщения в лог"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_text.append(f"[{timestamp}] {message}")
+        QApplication.processEvents()  # Обновляем UI
+    
+    def start_sync(self):
+        """Запуск синхронизации"""
+        if not self.document_manager.telegram_storage.test_connection():
+            self.log("❌ Ошибка: Проверьте настройки Telegram")
+            return
+        
+        self.sync_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        
+        # Запускаем синхронизацию в отдельном потоке
+        self.sync_thread = TelegramSyncThread(self.document_manager)
+        self.sync_thread.progress_update.connect(self.update_progress)
+        self.sync_thread.status_update.connect(self.update_status)
+        self.sync_thread.finished.connect(self.sync_finished)
+        self.sync_thread.start()
+    
+    def update_progress(self, value, maximum):
+        """Обновление прогресса"""
+        self.progress_bar.setMaximum(maximum)
+        self.progress_bar.setValue(value)
+    
+    def update_status(self, message):
+        """Обновление статуса"""
+        self.status_label.setText(message)
+        self.log(message)
+    
+    def sync_finished(self):
+        """Завершение синхронизации"""
+        self.sync_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(True)
+        self.status_label.setText("Синхронизация завершена")
+        self.log("✅ Синхронизация завершена")
+        
+        # Обновляем список документов в главном окне
+        self.document_manager.load_documents()
+
+class TelegramSyncThread(QThread):
+    progress_update = pyqtSignal(int, int)
+    status_update = pyqtSignal(str)
+    
+    def __init__(self, document_manager):
+        super().__init__()
+        self.document_manager = document_manager
+        self.storage = document_manager.telegram_storage
+        self.user_client = document_manager.telegram_user_client
+        self.is_running = True
+    
+    def run(self):
+        """Основной процесс синхронизации"""
+        try:
+            self.status_update.emit("🔍 Начинаем синхронизацию с Telegram...")
+            
+            # Получаем историю чата
+            messages = self.get_chat_history()
+            if not messages:
+                self.status_update.emit("❌ Не удалось получить историю чата или чат пуст")
+                return
+            
+            self.status_update.emit(f"📨 Получено сообщений: {len(messages)}")
+            
+            # Фильтруем сообщения с документами
+            document_messages = [
+                msg for msg in messages 
+                if hasattr(msg, 'document') or hasattr(msg, 'photo')
+            ]
+            
+            self.status_update.emit(f"📁 Найдено {len(document_messages)} сообщений с документами/фото")
+            
+            # Загружаем локальную базу
+            local_data = self.document_manager.load_data()
+            local_files = {doc['filename']: doc for doc in local_data['documents']}
+            
+            # Синхронизация
+            downloaded_count = 0
+            self.progress_update.emit(0, len(document_messages))
+            
+            for i, message in enumerate(document_messages):
+                if not self.is_running:
+                    break
+                    
+                try:
+                    self.status_update.emit(f"🔍 Обработка сообщения {i+1}/{len(document_messages)}")
+                    result = self.process_message(message, local_files, local_data)
+                    if result:
+                        downloaded_count += 1
+                        self.status_update.emit(f"✅ Загружен: {result}")
+                    else:
+                        filename = "Unknown"
+                        if hasattr(message, 'document') and message.document:
+                            filename = getattr(message.document, 'attributes', [{}])[0].file_name if hasattr(message.document, 'attributes') and message.document.attributes else f"document_{message.id}"
+                        elif hasattr(message, 'photo') and message.photo:
+                            filename = f"photo_{message.id}.jpg"
+                        self.status_update.emit(f"⏭️ Пропущен (уже существует): {filename}")
+                    
+                except Exception as e:
+                    self.status_update.emit(f"⚠️ Ошибка обработки сообщения: {str(e)}")
+                
+                self.progress_update.emit(i + 1, len(document_messages))
+            
+            self.status_update.emit(f"🎉 Синхронизация завершена. Новых файлов: {downloaded_count}")
+            
+        except Exception as e:
+            self.status_update.emit(f"❌ Ошибка синхронизации: {str(e)}")
+    
+    def get_chat_history(self):
+        """Получение истории чата через User API"""
+        try:
+            self.status_update.emit("🔄 Подключение через User API...")
+            
+            # Создаем новый event loop для этого потока
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            # Устанавливаем loop для клиента
+            self.user_client.set_event_loop(loop)
+            
+            # Проверяем подключение
+            success, message = loop.run_until_complete(self.user_client.test_connection())
+            
+            if not success:
+                self.status_update.emit(f"❌ {message}")
+                loop.run_until_complete(self.user_client.disconnect())
+                loop.close()
+                return []
+            
+            self.status_update.emit("✅ Успешная авторизация, получаем историю чата...")
+            
+            # Получаем историю
+            messages, status_message = loop.run_until_complete(
+                self.user_client.get_chat_history(self.storage.chat_id, limit=1000)
+            )
+            
+            self.status_update.emit(f"📨 {status_message}")
+            
+            # Отключаем клиента и закрываем loop
+            loop.run_until_complete(self.user_client.disconnect())
+            loop.close()
+            
+            return messages if messages else []
+            
+        except Exception as e:
+            self.status_update.emit(f"❌ Ошибка получения истории: {str(e)}")
+            return []
+    
+    def process_message(self, message, local_files, local_data):
+        """Обработка одного сообщения"""
+        try:
+            # Определяем тип файла и file_id
+            file_info = None
+            file_type = None
+            file_name = None
+            file_id = None
+            
+            if hasattr(message, 'document') and message.document:
+                file_info = message.document
+                file_type = 'document'
+                # Получаем имя файла из атрибутов документа
+                file_name = getattr(file_info, 'attributes', [{}])[0].file_name if hasattr(file_info, 'attributes') and file_info.attributes else f"document_{file_info.id}"
+                file_id = str(file_info.id)
+            elif hasattr(message, 'photo') and message.photo:
+                # Для фото берем самую качественную версию
+                file_info = message.photo
+                file_type = 'photo'
+                file_name = f"photo_{file_info.id}.jpg"
+                file_id = str(file_info.id)
+            else:
+                return None
+            
+            if not file_info:
+                return None
+            
+            # Проверяем, есть ли файл уже в локальной базе по file_id
+            for doc in local_data['documents']:
+                if doc.get('telegram_file_id') == file_id:
+                    return None
+            
+            # Скачиваем файл
+            downloaded_path = self.download_file(file_id, file_name, file_type)
+            if not downloaded_path:
+                return None
+            
+            # Извлекаем метаданные из caption и текста сообщения
+            metadata = self.extract_metadata(
+                getattr(message, 'caption', '') or '',
+                getattr(message, 'text', '') or ''
+            )
+            
+            # Добавляем в базу
+            doc_data = {
+                'filename': file_name,
+                'path': downloaded_path,
+                'type': metadata.get('type', 'unknown'),
+                'doc_number': metadata.get('doc_number', ''),
+                'doc_date': metadata.get('doc_date', ''),
+                'sender': metadata.get('sender', ''),
+                'executor': metadata.get('executor', ''),
+                'date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'size': os.path.getsize(downloaded_path),
+                'telegram_file_id': file_id,
+                'telegram_message_id': message.id,
+                'sync_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+            local_data['documents'].append(doc_data)
+            self.document_manager.save_data(local_data)
+            
+            return file_name
+            
+        except Exception as e:
+            self.status_update.emit(f"❌ Ошибка обработки сообщения: {str(e)}")
+            return None
+    
+    def download_file(self, file_id, file_name, file_type):
+        """Скачивание файла из Telegram через Bot API"""
+        try:
+            self.status_update.emit(f"⬇️ Скачивание файла: {file_name}")
+            
+            # Для User API нам нужно скачивать через клиента, но это сложно
+            # Вместо этого используем Bot API для скачивания, если доступно
+            if not self.storage.token:
+                self.status_update.emit("❌ Для скачивания требуется Bot Token")
+                return None
+            
+            # Получаем информацию о файле
+            url = f"https://api.telegram.org/bot{self.storage.token}/getFile"
+            response = requests.post(url, data={'file_id': file_id}, timeout=30)
+            
+            if response.status_code != 200:
+                self.status_update.emit(f"❌ Ошибка получения file info: {response.status_code}")
+                return None
+            
+            file_data = response.json()
+            if not file_data.get('ok'):
+                self.status_update.emit(f"❌ Ошибка file data: {file_data.get('description')}")
+                return None
+            
+            file_path = file_data['result']['file_path']
+            
+            # Скачиваем файл
+            download_url = f"https://api.telegram.org/file/bot{self.storage.token}/{file_path}"
+            file_response = requests.get(download_url, timeout=60)
+            
+            if file_response.status_code == 200:
+                # Сохраняем в папку "Синхронизированные"
+                sync_dir = os.path.join(self.document_manager.base_dir, "Синхронизированные")
+                os.makedirs(sync_dir, exist_ok=True)
+                
+                # Сохраняем с оригинальным расширением если возможно
+                if '.' in file_name and file_type == 'document':
+                    final_path = os.path.join(sync_dir, file_name)
+                else:
+                    # Для фото или файлов без расширения определяем расширение
+                    extension = self.get_file_extension(file_response.headers.get('content-type', ''))
+                    final_path = os.path.join(sync_dir, f"{file_name}{extension}")
+                
+                with open(final_path, 'wb') as f:
+                    f.write(file_response.content)
+                
+                self.status_update.emit(f"✅ Файл сохранен: {os.path.basename(final_path)}")
+                return final_path
+            else:
+                self.status_update.emit(f"❌ Ошибка скачивания: {file_response.status_code}")
+                return None
+            
+        except Exception as e:
+            self.status_update.emit(f"💥 Ошибка скачивания файла {file_name}: {e}")
+            return None
+    
+    def get_file_extension(self, content_type):
+        """Определение расширения файла по content-type"""
+        extension_map = {
+            'image/jpeg': '.jpg',
+            'image/png': '.png',
+            'image/gif': '.gif',
+            'application/pdf': '.pdf',
+            'application/msword': '.doc',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+            'text/plain': '.txt'
+        }
+        return extension_map.get(content_type, '.bin')
+    
+    def extract_metadata(self, caption, text):
+        """Извлечение метаданных из описания и текста сообщения"""
+        metadata = {}
+        
+        # Объединяем caption и text для поиска метаданных
+        content = f"{caption} {text}".strip()
+        
+        if not content:
+            return metadata
+        
+        # Парсим HTML/текстовое описание
+        lines = content.replace('<b>', '').replace('</b>', '').split('\n')
+        
+        for line in lines:
+            line = line.strip()
+            line_lower = line.lower()
+            
+            if 'входящий' in line_lower:
+                metadata['type'] = 'incoming'
+            elif 'исходящий' in line_lower:
+                metadata['type'] = 'outgoing'
+            elif 'номер:' in line_lower:
+                metadata['doc_number'] = line.split(':', 1)[1].strip()
+            elif 'дата:' in line_lower:
+                metadata['doc_date'] = line.split(':', 1)[1].strip()
+            elif 'отправитель:' in line_lower:
+                metadata['sender'] = line.split(':', 1)[1].strip()
+            elif 'исполнитель:' in line_lower:
+                metadata['executor'] = line.split(':', 1)[1].strip()
+        
+        return metadata
+    
+    def stop(self):
+        """Остановка синхронизации"""
+        self.is_running = False
+
+class TelegramUserClient:
+    def __init__(self):
+        self.api_id = os.getenv('TELEGRAM_API_ID')
+        self.api_hash = os.getenv('TELEGRAM_API_HASH')
+        self.phone = os.getenv('TELEGRAM_PHONE')
+        self.session_file = 'telegram_session'
+        self.client = None
+        self.is_authorized = False
+        self.loop = None
+    
+    def set_event_loop(self, loop):
+        """Установка event loop для клиента"""
+        self.loop = loop
+        asyncio.set_event_loop(loop)
+    
+    async def _get_client(self):
+        """Создает и возвращает клиента"""
+        if not self.client:
+            self.client = TelegramClient(self.session_file, self.api_id, self.api_hash)
+            await self.client.connect()
+        return self.client
+    
+    async def test_connection(self):
+        """Проверка подключения и авторизации"""
+        try:
+            if not self.api_id or not self.api_hash:
+                return False, "API ID и API Hash не настроены"
+            
+            client = await self._get_client()
+            
+            # Проверяем существование сессии
+            if os.path.exists(f'{self.session_file}.session'):
+                try:
+                    if await client.is_user_authorized():
+                        self.is_authorized = True
+                        return True, "✅ Успешная авторизация по сессии"
+                    else:
+                        return False, "❌ Сессия устарела, требуется повторная авторизация"
+                except Exception as e:
+                    return False, f"❌ Ошибка сессии: {str(e)}"
+            else:
+                return False, "❌ Сессия не найдена, требуется авторизация"
+                
+        except Exception as e:
+            return False, f"❌ Ошибка подключения: {str(e)}"
+    
+    async def authorize(self, phone=None, code=None, password=None):
+        """Процесс авторизации"""
+        try:
+            client = await self._get_client()
+            
+            if not await client.is_user_authorized():
+                if phone:
+                    self.phone = phone
+                    await client.send_code_request(self.phone)
+                    return "code_required"
+                elif code:
+                    try:
+                        await client.sign_in(self.phone, code)
+                        self.is_authorized = True
+                        return "authorized"
+                    except SessionPasswordNeededError:
+                        return "password_required"
+                elif password:
+                    await client.sign_in(password=password)
+                    self.is_authorized = True
+                    return "authorized"
+            else:
+                self.is_authorized = True
+                return "authorized"
+                
+        except Exception as e:
+            return f"error: {str(e)}"
+    
+    async def get_chat_history(self, chat_id, limit=1000):
+        """Получение истории чата"""
+        try:
+            if not self.is_authorized:
+                return None, "Не авторизован"
+            
+            client = await self._get_client()
+            
+            # Получаем entity чата
+            try:
+                chat = await client.get_entity(chat_id)
+            except ValueError:
+                # Если не можем найти по ID, пробуем по username
+                try:
+                    chat = await client.get_entity(chat_id)
+                except Exception as e:
+                    return None, f"Не удалось найти чат: {str(e)}"
+            
+            messages = []
+            
+            # Получаем сообщения с документами
+            async for message in client.iter_messages(chat, limit=limit, filter=InputMessagesFilterDocument):
+                messages.append(message)
+            
+            # Получаем сообщения с фото
+            async for message in client.iter_messages(chat, limit=limit, filter=InputMessagesFilterPhotos):
+                messages.append(message)
+            
+            return messages, f"Получено {len(messages)} сообщений"
+            
+        except Exception as e:
+            return None, f"Ошибка получения истории: {str(e)}"
+    
+    async def disconnect(self):
+        """Отключение клиента"""
+        if self.client:
+            await self.client.disconnect()
+            self.client = None
+
+class TelegramAuthDialog(QDialog):
+    def __init__(self, user_client, parent=None):
+        super().__init__(parent)
+        self.user_client = user_client
+        self.setWindowTitle("Авторизация Telegram")
+        self.setFixedSize(400, 300)
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #2b2b2b;
+                color: #ffffff;
+            }
+            QLabel {
+                color: #ffffff;
+            }
+            QLineEdit, QPushButton {
+                background-color: #353535;
+                color: #ffffff;
+                border: 1px solid #555555;
+                border-radius: 3px;
+                padding: 8px;
+            }
+            QPushButton {
+                background-color: #4a6fa5;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #5a7fb5;
+            }
+            QPushButton:disabled {
+                background-color: #555555;
+            }
+        """)
+        self.auth_stage = "initial"  # initial, code_required, password_required
+        self.init_ui()
+    
+    def init_ui(self):
+        layout = QVBoxLayout()
+        self.setLayout(layout)
+        
+        # Информация
+        self.info_label = QLabel(
+            "Для синхронизации требуется авторизация в Telegram.\n\n"
+            "Данные для входа не сохраняются, используется только сессия."
+        )
+        self.info_label.setWordWrap(True)
+        self.info_label.setStyleSheet("padding: 10px; background-color: #2b5278; border-radius: 5px;")
+        layout.addWidget(self.info_label)
+        
+        # Поля ввода
+        form_layout = QFormLayout()
+        
+        self.phone_edit = QLineEdit()
+        self.phone_edit.setPlaceholderText("+79123456789")
+        self.phone_edit.setText(os.getenv('TELEGRAM_PHONE', ''))
+        
+        self.code_edit = QLineEdit()
+        self.code_edit.setPlaceholderText("12345")
+        self.code_edit.setVisible(False)
+        
+        self.password_edit = QLineEdit()
+        self.password_edit.setPlaceholderText("Пароль 2FA")
+        self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password_edit.setVisible(False)
+        
+        form_layout.addRow("Номер телефона:", self.phone_edit)
+        form_layout.addRow("Код из Telegram:", self.code_edit)
+        form_layout.addRow("Пароль 2FA:", self.password_edit)
+        
+        layout.addLayout(form_layout)
+        
+        # Статус
+        self.status_label = QLabel("Введите номер телефона")
+        layout.addWidget(self.status_label)
+        
+        # Кнопки
+        button_layout = QHBoxLayout()
+        
+        self.auth_btn = QPushButton("Авторизоваться")
+        self.auth_btn.clicked.connect(self.handle_auth)
+        
+        self.cancel_btn = QPushButton("Отмена")
+        self.cancel_btn.clicked.connect(self.reject)
+        
+        button_layout.addWidget(self.auth_btn)
+        button_layout.addWidget(self.cancel_btn)
+        
+        layout.addLayout(button_layout)
+    
+    def handle_auth(self):
+        """Обработка авторизации"""
+        if self.auth_stage == "initial":
+            self.request_code()
+        elif self.auth_stage == "code_required":
+            self.submit_code()
+        elif self.auth_stage == "password_required":
+            self.submit_password()
+    
+    def request_code(self):
+        """Запрос кода подтверждения"""
+        phone = self.phone_edit.text().strip()
+        if not phone:
+            self.status_label.setText("❌ Введите номер телефона")
+            return
+        
+        # Сохраняем номер в env
+        os.environ['TELEGRAM_PHONE'] = phone
+        
+        # Запускаем запрос кода в отдельном потоке
+        self.auth_btn.setEnabled(False)
+        self.status_label.setText("⌛ Отправка запроса...")
+        
+        self.auth_thread = AuthThread(self.user_client, phone=phone)
+        self.auth_thread.finished.connect(self.on_auth_result)
+        self.auth_thread.start()
+    
+    def submit_code(self):
+        """Отправка кода подтверждения"""
+        code = self.code_edit.text().strip()
+        if not code:
+            self.status_label.setText("❌ Введите код из Telegram")
+            return
+        
+        self.auth_btn.setEnabled(False)
+        self.status_label.setText("⌛ Проверка кода...")
+        
+        self.auth_thread = AuthThread(self.user_client, code=code)
+        self.auth_thread.finished.connect(self.on_auth_result)
+        self.auth_thread.start()
+    
+    def submit_password(self):
+        """Отправка пароля 2FA"""
+        password = self.password_edit.text().strip()
+        if not password:
+            self.status_label.setText("❌ Введите пароль 2FA")
+            return
+        
+        self.auth_btn.setEnabled(False)
+        self.status_label.setText("⌛ Проверка пароля...")
+        
+        self.auth_thread = AuthThread(self.user_client, password=password)
+        self.auth_thread.finished.connect(self.on_auth_result)
+        self.auth_thread.start()
+    
+    def on_auth_result(self, result):
+        """Обработка результата авторизации"""
+        self.auth_btn.setEnabled(True)
+        
+        if result == "code_required":
+            self.auth_stage = "code_required"
+            self.phone_edit.setEnabled(False)
+            self.code_edit.setVisible(True)
+            self.status_label.setText("✅ Код отправлен. Введите код из Telegram")
+        
+        elif result == "password_required":
+            self.auth_stage = "password_required"
+            self.code_edit.setEnabled(False)
+            self.password_edit.setVisible(True)
+            self.status_label.setText("🔒 Требуется пароль 2FA")
+        
+        elif result == "authorized":
+            self.status_label.setText("✅ Успешная авторизация!")
+            QTimer.singleShot(1000, self.accept)
+        
+        elif result.startswith("error:"):
+            error_msg = result.replace("error:", "").strip()
+            self.status_label.setText(f"❌ Ошибка: {error_msg}")
+            
+            # Сбрасываем на начальный этап при ошибке
+            self.auth_stage = "initial"
+            self.phone_edit.setEnabled(True)
+            self.code_edit.setVisible(False)
+            self.code_edit.setEnabled(True)
+            self.code_edit.clear()
+            self.password_edit.setVisible(False)
+            self.password_edit.clear()
+
+class AuthThread(QThread):
+    finished = pyqtSignal(str)
+    
+    def __init__(self, user_client, phone=None, code=None, password=None):
+        super().__init__()
+        self.user_client = user_client
+        self.phone = phone
+        self.code = code
+        self.password = password
+    
+    def run(self):
+        try:
+            # Создаем новый event loop для этого потока
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            # Устанавливаем loop для клиента
+            self.user_client.set_event_loop(loop)
+            
+            # Запускаем авторизацию
+            result = loop.run_until_complete(
+                self.user_client.authorize(self.phone, self.code, self.password)
+            )
+            
+            # Закрываем loop
+            loop.close()
+            
+            self.finished.emit(result)
+            
+        except Exception as e:
+            self.finished.emit(f"error: {str(e)}")
 class TelegramStorage:
     def __init__(self):
         self.token = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -243,12 +992,12 @@ class OpenFileThread(QThread):
             self.finished.emit()
 
 class SettingsDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
+    def __init__(self, document_manager=None):
+        super().__init__(document_manager)
         self.setWindowTitle("Настройки")
         self.setFixedSize(600, 500)
         
-        self.parent = parent
+        self.document_manager = document_manager
         self.init_ui()
         self.load_data()
     
@@ -316,6 +1065,76 @@ class SettingsDialog(QDialog):
         tabs = QTabWidget()
         layout.addWidget(tabs)
         
+        self.sync_tab = QWidget()
+        sync_layout = QVBoxLayout(self.sync_tab)
+
+        sync_info = QLabel(
+            "Синхронизация позволяет загрузить документы из Telegram чата,\n"
+            "которые были добавлены напрямую в чат или из других источников.\n\n"
+            "Бот должен иметь права администратора для чтения истории сообщений."
+        )
+        sync_info.setWordWrap(True)
+        sync_info.setStyleSheet("padding: 10px; background-color: #2b5278; border-radius: 5px; color: white;")
+        sync_layout.addWidget(sync_info)
+
+        sync_btn = QPushButton("Запустить синхронизацию")
+        sync_btn.clicked.connect(self.open_sync_dialog)
+        sync_layout.addWidget(sync_btn)
+
+        sync_layout.addStretch()
+
+        tabs.addTab(self.sync_tab, "Синхронизация")
+
+
+        # Вкладка Telegram User API
+        self.user_api_tab = QWidget()
+        user_api_layout = QVBoxLayout(self.user_api_tab)
+
+        user_api_info = QLabel(
+            "Для синхронизации истории чата требуется авторизация пользователя.\n\n"
+            "1. Получите API ID и API Hash на https://my.telegram.org/apps\n"
+            "2. Введите номер телефона аккаунта\n"
+            "3. Авторизуйтесь через код из Telegram\n\n"
+            "⚠️ Сессия сохраняется локально, данные для входа не хранятся."
+        )
+        user_api_info.setWordWrap(True)
+        user_api_info.setStyleSheet("padding: 10px; background-color: #2b5278; border-radius: 5px; color: white;")
+        user_api_layout.addWidget(user_api_info)
+
+        user_api_form = QFormLayout()
+
+        self.api_id_edit = QLineEdit()
+        self.api_id_edit.setPlaceholderText("1234567")
+        self.api_id_edit.setText(os.getenv('TELEGRAM_API_ID', ''))
+
+        self.api_hash_edit = QLineEdit()
+        self.api_hash_edit.setPlaceholderText("a1b2c3d4e5f6g7h8i9j0")
+        self.api_hash_edit.setText(os.getenv('TELEGRAM_API_HASH', ''))
+
+        self.phone_edit = QLineEdit()
+        self.phone_edit.setPlaceholderText("+79123456789")
+        self.phone_edit.setText(os.getenv('TELEGRAM_PHONE', ''))
+
+        user_api_form.addRow("API ID:", self.api_id_edit)
+        user_api_form.addRow("API Hash:", self.api_hash_edit)
+        user_api_form.addRow("Номер телефона:", self.phone_edit)
+
+        btn_layout = QHBoxLayout()
+        self.test_user_btn = QPushButton("Проверить подключение")
+        self.test_user_btn.clicked.connect(self.test_user_connection)
+
+        self.auth_btn = QPushButton("Авторизоваться")
+        self.auth_btn.clicked.connect(self.open_auth_dialog)
+
+        btn_layout.addWidget(self.test_user_btn)
+        btn_layout.addWidget(self.auth_btn)
+
+        user_api_layout.addLayout(user_api_form)
+        user_api_layout.addLayout(btn_layout)
+        user_api_layout.addStretch()
+
+        tabs.addTab(self.user_api_tab, "Telegram User API")
+
         # Вкладка Telegram
         self.telegram_tab = QWidget()
         telegram_layout = QVBoxLayout(self.telegram_tab)
@@ -365,6 +1184,7 @@ class SettingsDialog(QDialog):
         self.senders_table.setHorizontalHeaderLabels(["ID", "Имя", "Описание"])
         self.senders_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.senders_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.senders_table.verticalHeader().setVisible(False)
         
         add_sender_btn = QPushButton("Добавить отправителя")
         add_sender_btn.clicked.connect(self.add_sender)
@@ -386,6 +1206,7 @@ class SettingsDialog(QDialog):
         self.executors_table.setHorizontalHeaderLabels(["ID", "Имя", "Описание"])
         self.executors_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.executors_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.executors_table.verticalHeader().setVisible(False)
         
         add_executor_btn = QPushButton("Добавить исполнителя")
         add_executor_btn.clicked.connect(self.add_executor)
@@ -408,6 +1229,11 @@ class SettingsDialog(QDialog):
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
     
+    def open_sync_dialog(self):
+        """Открытие диалога синхронизации"""
+        dialog = TelegramSyncDialog(self.document_manager)
+        dialog.exec()
+
     def test_telegram_connection(self):
         """Проверка подключения к Telegram"""
         token = self.telegram_token_edit.text().strip()
@@ -427,10 +1253,48 @@ class SettingsDialog(QDialog):
             QMessageBox.information(self, "Успех", "✅ Подключение к Telegram установлено!")
         else:
             QMessageBox.warning(self, "Ошибка", "❌ Не удалось подключиться к Telegram")
-    
+        
+    def test_user_connection(self):
+        """Проверка подключения User API"""
+        # Сохраняем временно в переменные окружения
+        os.environ['TELEGRAM_API_ID'] = self.api_id_edit.text().strip()
+        os.environ['TELEGRAM_API_HASH'] = self.api_hash_edit.text().strip()
+        os.environ['TELEGRAM_PHONE'] = self.phone_edit.text().strip()
+        
+        user_client = TelegramUserClient()
+        
+        # Создаем новый event loop для теста
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            success, message = loop.run_until_complete(user_client.test_connection())
+            
+            if success:
+                QMessageBox.information(self, "Успех", f"✅ {message}")
+            else:
+                QMessageBox.warning(self, "Ошибка", f"❌ {message}")
+        finally:
+            loop.run_until_complete(user_client.disconnect())
+            loop.close()
+
+    def open_auth_dialog(self):
+        """Открытие диалога авторизации"""
+        # Сохраняем настройки
+        os.environ['TELEGRAM_API_ID'] = self.api_id_edit.text().strip()
+        os.environ['TELEGRAM_API_HASH'] = self.api_hash_edit.text().strip()
+        os.environ['TELEGRAM_PHONE'] = self.phone_edit.text().strip()
+        
+        user_client = TelegramUserClient()
+        dialog = TelegramAuthDialog(user_client, self)
+        
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            QMessageBox.information(self, "Успех", "✅ Авторизация прошла успешно!")
+            self.test_user_connection()  # Обновляем статус
+
     def load_data(self):
         """Загрузка данных отправителей и исполнителей"""
-        data = self.parent.load_data()
+        data = self.document_manager.load_data()
         
         self.senders_table.setRowCount(len(data["senders"]))
         for row, sender in enumerate(data["senders"]):
@@ -471,7 +1335,7 @@ class SettingsDialog(QDialog):
                 QMessageBox.warning(self, "Ошибка", "Имя не может быть пустым")
                 return
             
-            data = self.parent.load_data()
+            data = self.document_manager.load_data()
             if any(s["name"].lower() == name.lower() for s in data["senders"]):
                 QMessageBox.warning(self, "Ошибка", "Отправитель с таким именем уже существует")
                 return
@@ -485,7 +1349,7 @@ class SettingsDialog(QDialog):
             }
             
             data["senders"].append(new_sender)
-            self.parent.save_data(data)
+            self.document_manager.save_data(data)
             self.load_data()
     
     def remove_sender(self):
@@ -506,9 +1370,9 @@ class SettingsDialog(QDialog):
         )
         
         if reply == QMessageBox.StandardButton.Yes:
-            data = self.parent.load_data()
+            data = self.document_manager.load_data()
             data["senders"] = [s for s in data["senders"] if s["id"] != sender_id]
-            self.parent.save_data(data)
+            self.document_manager.save_data(data)
             self.load_data()
     
     def add_executor(self):
@@ -538,7 +1402,7 @@ class SettingsDialog(QDialog):
                 QMessageBox.warning(self, "Ошибка", "Имя не может быть пустым")
                 return
             
-            data = self.parent.load_data()
+            data = self.document_manager.load_data()
             if any(e["name"].lower() == name.lower() for e in data["executors"]):
                 QMessageBox.warning(self, "Ошибка", "Исполнитель с таким именем уже существует")
                 return
@@ -552,7 +1416,7 @@ class SettingsDialog(QDialog):
             }
             
             data["executors"].append(new_executor)
-            self.parent.save_data(data)
+            self.document_manager.save_data(data)
             self.load_data()
     
     def remove_executor(self):
@@ -573,21 +1437,26 @@ class SettingsDialog(QDialog):
         )
         
         if reply == QMessageBox.StandardButton.Yes:
-            data = self.parent.load_data()
+            data = self.document_manager.load_data()
             data["executors"] = [e for e in data["executors"] if e["id"] != executor_id]
-            self.parent.save_data(data)
+            self.document_manager.save_data(data)
             self.load_data()
 
     def accept(self):
-        """Сохранение настроек Telegram при закрытии"""
-        # Сохраняем настройки Telegram в .env файл
+        """Сохранение всех настроек при закрытии"""
+        # Сохраняем настройки Telegram Bot в .env файл
         token = self.telegram_token_edit.text().strip()
         chat_id = self.telegram_chat_id_edit.text().strip()
+        
+        # Сохраняем настройки User API
+        api_id = self.api_id_edit.text().strip()
+        api_hash = self.api_hash_edit.text().strip()
+        phone = self.phone_edit.text().strip()
         
         env_file_path = '.env'
         env_data = {}
         
-        # Читаем существующие переменные из .env файла
+        # Читаем существующие переменные
         if os.path.exists(env_file_path):
             with open(env_file_path, 'r', encoding='utf-8') as f:
                 for line in f:
@@ -596,56 +1465,54 @@ class SettingsDialog(QDialog):
                         key, value = line.split('=', 1)
                         env_data[key] = value
         
-        # Обновляем только Telegram настройки
-        if token:
-            env_data['TELEGRAM_BOT_TOKEN'] = token
-        elif 'TELEGRAM_BOT_TOKEN' in env_data:
-            # Если токен удален, удаляем его из настроек
-            del env_data['TELEGRAM_BOT_TOKEN']
-            
-        if chat_id:
-            env_data['TELEGRAM_CHAT_ID'] = chat_id
-        elif 'TELEGRAM_CHAT_ID' in env_data:
-            # Если chat_id удален, удаляем его из настроек
-            del env_data['TELEGRAM_CHAT_ID']
+        # Обновляем все настройки
+        settings_to_update = {
+            'TELEGRAM_BOT_TOKEN': token,
+            'TELEGRAM_CHAT_ID': chat_id,
+            'TELEGRAM_API_ID': api_id,
+            'TELEGRAM_API_HASH': api_hash,
+            'TELEGRAM_PHONE': phone
+        }
         
-        # Записываем обновленные настройки обратно в .env файл
+        for key, value in settings_to_update.items():
+            if value:
+                env_data[key] = value
+            elif key in env_data:
+                del env_data[key]
+        
+        # Записываем обновленные настройки
         try:
             with open(env_file_path, 'w', encoding='utf-8') as f:
                 for key, value in env_data.items():
                     f.write(f'{key}={value}\n')
             
-            logger.info(f"Настройки Telegram сохранены в {env_file_path}")
+            logger.info(f"Настройки сохранены в {env_file_path}")
             
         except Exception as e:
-            logger.error(f"Ошибка сохранения настроек Telegram: {e}")
+            logger.error(f"Ошибка сохранения настроек: {e}")
             QMessageBox.warning(self, "Ошибка", f"Не удалось сохранить настройки: {e}")
             return
         
-        # Обновляем переменные окружения в текущей сессии
-        if token:
-            os.environ['TELEGRAM_BOT_TOKEN'] = token
-        elif 'TELEGRAM_BOT_TOKEN' in os.environ:
-            del os.environ['TELEGRAM_BOT_TOKEN']
-            
-        if chat_id:
-            os.environ['TELEGRAM_CHAT_ID'] = chat_id
-        elif 'TELEGRAM_CHAT_ID' in os.environ:
-            del os.environ['TELEGRAM_CHAT_ID']
+        # Обновляем переменные окружения
+        for key, value in settings_to_update.items():
+            if value:
+                os.environ[key] = value
+            elif key in os.environ:
+                del os.environ[key]
         
-        # Перезагружаем переменные окружения для TelegramStorage
+        # Перезагружаем переменные окружения
         load_dotenv(override=True)
         
-        # Обновляем статус Telegram в главном окне
-        self.parent.update_telegram_status()
+        # Обновляем статус в главном окне
+        self.document_manager.update_telegram_status()
         
-        QMessageBox.information(self, "Успех", "Настройки Telegram успешно сохранены!")
+        QMessageBox.information(self, "Успех", "Настройки успешно сохранены!")
         
         super().accept()
 
 class DocumentUploadDialog(QDialog):
-    def __init__(self, doc_type, parent=None):
-        super().__init__(parent)
+    def __init__(self, doc_type, document_manager=None):
+        super().__init__(document_manager)
         self.setWindowTitle(f"Детали {'входящего' if doc_type == 'incoming' else 'исходящего'} письма")
         self.setFixedSize(300, 200)
         self.setStyleSheet("""
@@ -706,7 +1573,16 @@ class DocumentManager(QMainWindow):
         self.setWindowTitle("Архив документов")
         self.setGeometry(100, 100, 1000, 600)
         
-        self.base_dir = os.path.join(os.path.dirname(__file__), "Документы архива")
+        self.telegram_user_client = TelegramUserClient()
+
+        if getattr(sys, 'frozen', False):
+            # Если программа запущена как собранный EXE
+            application_path = os.path.dirname(sys.executable)
+        else:
+            # Если программа запущена как скрипт Python
+            application_path = os.path.dirname(os.path.abspath(__file__))
+        
+        self.base_dir = os.path.join(application_path, "Документы архива")
         self.incoming_dir = os.path.join(self.base_dir, "Входящие документы")
         self.executors_dir = os.path.join(self.base_dir, "Исходящие документы")
         
@@ -725,7 +1601,28 @@ class DocumentManager(QMainWindow):
         self.init_ui()
         self.migrate_data()
         self.load_documents()
-        self.showMaximized()
+        
+        # Получаем размеры экрана
+        screen = QApplication.primaryScreen()
+        screen_geometry = screen.availableGeometry()
+        
+        # Устанавливаем минимальный размер (примерно 80% от экрана)
+        min_width = int(screen_geometry.width() * 0.99)
+        min_height = int(screen_geometry.height() * 0.99)
+        self.setMinimumSize(min_width, min_height)
+        
+        # Устанавливаем начальный размер (90% от экрана)
+        initial_width = int(screen_geometry.width() * 0.99)
+        initial_height = int(screen_geometry.height() * 0.99)
+        self.resize(initial_width, initial_height)
+        
+        # Центрируем окно
+        self.move(
+            (screen_geometry.width() - initial_width) // 2,
+            (screen_geometry.height() - initial_height) // 2
+        )
+        
+        self.show()
 
     def init_data(self):
         """Инициализация данных при первом запуске"""
@@ -1816,6 +2713,13 @@ class DocumentManager(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    
+    # Создаем и настраиваем event loop для asyncio
+    loop = qasync.QEventLoop(app)
+    asyncio.set_event_loop(loop)
+    
     window = DocumentManager()
     window.show()
-    sys.exit(app.exec())
+    
+    with loop:
+        sys.exit(loop.run_forever())
