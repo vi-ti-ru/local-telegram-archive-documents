@@ -386,6 +386,8 @@ class SettingsDialog(QDialog):
         self.executors_table.setHorizontalHeaderLabels(["ID", "Имя", "Описание"])
         self.executors_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.executors_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.senders_table.verticalHeader().setVisible(False)
+        self.executors_table.verticalHeader().setVisible(False)
         
         add_executor_btn = QPushButton("Добавить исполнителя")
         add_executor_btn.clicked.connect(self.add_executor)
